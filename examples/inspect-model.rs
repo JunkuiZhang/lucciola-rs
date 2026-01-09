@@ -19,5 +19,7 @@ fn main() -> anyhow::Result<()> {
         println!("{:<60} | {:<20?} | {:?}", name, view.shape(), view.dtype());
     }
 
+    println!("Total tensors: {}", tensors.len());
+
     Ok(())
 }
