@@ -9,3 +9,5 @@ cudarc = { version = "0.18", features = [
     "default",
     "cuda-version-from-build-system",
 ] }
+memmap2 = "0.9"
+safetensors = "0.7"
