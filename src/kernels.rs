@@ -18,10 +18,15 @@ pub(crate) struct CudaFunctions {
 
 impl CudaFunctions {
     pub(crate) fn load(context: &Arc<CudaContext>) -> Result<Self> {
-        let activation = load_cuda_funtion(context, ptx::ACTIVATION_PTX, "activation_kernel")?;
-        let attention = load_cuda_funtion(context, ptx::ATTENTION_PTX, "attention_kernel")?;
-        let rmsnorm = load_cuda_funtion(context, ptx::RMSNORM_PTX, "rmsnorm_kernel")?;
-        let rope = load_cuda_funtion(context, ptx::ROPE_PTX, "rope_kernel")?;
+        println!("Loading activation kernel...");
+        let activation = load_cuda_funtion(context, ptx::ACTIVATION_PTX, "silu_and_mul_kernel")?;
+        println!("Loading attention kernel...");
+        let attention = load_cuda_funtion(context, ptx::ATTENTION_PTX, "gqa_attention_kernel")?;
+        println!("Loading rmsnorm kernel...");
+        let rmsnorm = load_cuda_funtion(context, ptx::RMSNORM_PTX, "rmsnorm_nvidia")?;
+        println!("Loading rope kernel...");
+        let rope = load_cuda_funtion(context, ptx::ROPE_PTX, "rope")?;
+        println!("Loading softmax kernel...");
         let softmax = load_cuda_funtion(context, ptx::SOFTMAX_PTX, "softmax_kernel")?;
 
         Ok(Self {

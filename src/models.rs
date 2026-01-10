@@ -45,6 +45,7 @@ pub struct LayerWeights {
 
 pub struct Qwen2Model {
     pub embed_tokens: CudaSlice<bf16>,
+    pub lm_head: CudaSlice<bf16>,
     pub layers: Vec<LayerWeights>,
     pub final_norm: CudaSlice<bf16>,
     pub rope: RopeCache,
@@ -79,6 +80,10 @@ impl Qwen2Model {
         let stream = device.default_stream();
 
         let embed_tokens = get_tensor(&stream, &tensors, "model.embed_tokens.weight")?;
+        let lm_head = get_tensor(&stream, &tensors, "lm_head.weight").or_else(|_| {
+            println!("lm_head.weight not found, using embed_tokens (tied weights)");
+            Ok::<_, anyhow::Error>(embed_tokens.clone())
+        })?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
@@ -147,6 +152,7 @@ impl Qwen2Model {
 
         Ok(Qwen2Model {
             embed_tokens,
+            lm_head,
             layers,
             final_norm,
             rope,
@@ -424,6 +430,57 @@ impl Qwen2Model {
 }
 
 impl Qwen2Model {
+    pub fn sample(
+        &self,
+        _device: &CudaContext,
+        stream: &Arc<CudaStream>,
+        blas: &CudaBlas,
+        hidden_states: &CudaSlice<bf16>,
+    ) -> Result<Vec<f32>> {
+        let hidden_dim = hidden_states.len();
+        let vocab_size = self.lm_head.len() / hidden_dim;
+        let logits = stream.alloc_zeros::<bf16>(vocab_size)?;
+
+        // C = A * B
+        // C [V, 1] = lm_head [V, H] * hidden_states [H, 1]
+        // CuBLAS Col Major:
+        // A_mem is [H, V] (because RowMajor [V, H]). We want [V, H] -> OP_T. lda=H.
+        // B_mem is [H, 1]. We want [H, 1] -> OP_N. ldb=H.
+        // C_mem is [V, 1]. ldc=V.
+
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+
+        unsafe {
+            cublasGemmEx(
+                *blas.handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                vocab_size as i32, // m
+                1,                 // n
+                hidden_dim as i32, // k
+                &alpha as *const f32 as *const _,
+                self.lm_head.device_ptr(stream).0 as *const _,
+                cudaDataType::CUDA_R_16BF,
+                hidden_dim as i32, // lda
+                hidden_states.device_ptr(stream).0 as *const _,
+                cudaDataType::CUDA_R_16BF,
+                hidden_dim as i32, // ldb
+                &beta as *const f32 as *const _,
+                logits.device_ptr(stream).0 as *mut _,
+                cudaDataType::CUDA_R_16BF,
+                vocab_size as i32, // ldc
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            );
+        }
+
+        let mut host_data = vec![bf16::default(); vocab_size];
+        stream.memcpy_dtoh(&logits, &mut host_data)?;
+        stream.synchronize()?;
+        Ok(host_data.iter().map(|x: &bf16| x.to_f32()).collect())
+    }
+
     pub fn forward(
         &mut self,
         stream: &Arc<CudaStream>,
