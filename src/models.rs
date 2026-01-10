@@ -13,6 +13,12 @@ pub struct ModelConfig {
     pub num_hidden_layers: usize,
     pub hidden_size: usize,
     pub num_attention_heads: usize,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+}
+
+fn default_rope_theta() -> f32 {
+    1000000.0
 }
 
 pub struct LayerWeights {
@@ -28,6 +34,12 @@ pub struct Qwen2Model {
     pub embed_tokens: CudaSlice<bf16>,
     pub layers: Vec<LayerWeights>,
     pub final_norm: CudaSlice<bf16>,
+    pub rope: RopeCache,
+}
+
+pub struct RopeCache {
+    pub cos: CudaSlice<f32>,
+    pub sin: CudaSlice<f32>,
 }
 
 impl Qwen2Model {
@@ -76,10 +88,21 @@ impl Qwen2Model {
             layers.push(layer_weights);
         }
         let final_norm = get_tensor(&stream, &tensors, "model.norm.weight")?;
+
+        // Qwen2.5 head_dim = hidden_size / num_attention_heads
+        let head_dim = config.hidden_size / config.num_attention_heads;
+        let rope = RopeCache::new(
+            &stream,
+            config.max_position_embeddings,
+            head_dim,
+            config.rope_theta,
+        )?;
+
         Ok(Qwen2Model {
             embed_tokens,
             layers,
             final_norm,
+            rope,
         })
     }
 }
@@ -96,4 +119,32 @@ fn get_tensor(
     let bf16_data: &[bf16] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2) };
     Ok(stream.clone_htod(bf16_data)?)
+}
+
+impl RopeCache {
+    fn new(
+        stream: &Arc<CudaStream>,
+        max_position_embeddings: usize,
+        head_dim: usize,
+        base: f32,
+    ) -> Result<Self> {
+        let mut cos_h = vec![0.0f32; max_position_embeddings * (head_dim / 2)];
+        let mut sin_h = vec![0.0f32; max_position_embeddings * (head_dim / 2)];
+
+        for pos in 0..max_position_embeddings {
+            for i in 0..(head_dim / 2) {
+                let theta = (pos as f32) / base.powf((2 * i) as f32 / head_dim as f32);
+                cos_h[pos * (head_dim / 2) + i] = theta.cos();
+                sin_h[pos * (head_dim / 2) + i] = theta.sin();
+            }
+        }
+
+        let cos_dev = stream.clone_htod(&cos_h)?;
+        let sin_dev = stream.clone_htod(&sin_h)?;
+
+        Ok(RopeCache {
+            cos: cos_dev,
+            sin: sin_dev,
+        })
+    }
 }
