@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
+use cudarc::cublas::CudaBlas;
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
 };
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::Ptx;
 use half::bf16;
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
@@ -307,11 +306,11 @@ impl Qwen2Model {
         &self,
         stream: &Arc<CudaStream>,
         out: &mut CudaSlice<bf16>,
-        input: &CudaSlice<bf16>,
+        input: Option<&CudaSlice<bf16>>,
         weight: &CudaSlice<bf16>,
         epsilon: f32,
     ) -> Result<()> {
-        let num_elements = input.len();
+        let num_elements = out.len();
         let num_cols = weight.len();
         let num_rows = num_elements / num_cols;
         let cfg = LaunchConfig {
@@ -320,13 +319,22 @@ impl Qwen2Model {
             shared_mem_bytes: 0,
         };
         let num_cols = num_cols as i32;
+
+        let out_ptr = out.device_ptr(stream).0;
+        let input_ptr = if let Some(inp) = input {
+            inp.device_ptr(stream).0
+        } else {
+            out_ptr
+        };
+
         let mut build = stream.launch_builder(&self.cuda_functions.rmsnorm);
         build
-            .arg(out)
-            .arg(input)
+            .arg(&out_ptr)
+            .arg(&input_ptr)
             .arg(weight)
             .arg(&epsilon)
             .arg(&num_cols);
+
         unsafe {
             build.launch(cfg)?;
         }
@@ -337,13 +345,22 @@ impl Qwen2Model {
         &self,
         stream: &Arc<CudaStream>,
         out: &mut CudaSlice<bf16>,
-        gate: &CudaSlice<bf16>,
+        gate: Option<&CudaSlice<bf16>>,
         up: &CudaSlice<bf16>,
     ) -> Result<()> {
         let n = out.len() as i32;
         let cfg = LaunchConfig::for_num_elems(n as u32);
+
+        let out_ptr = out.device_ptr(stream).0;
+        let gate_ptr = if let Some(g) = gate {
+            g.device_ptr(stream).0
+        } else {
+            out_ptr
+        };
+
         let mut build = stream.launch_builder(&self.cuda_functions.activation);
-        build.arg(out).arg(gate).arg(up).arg(&n);
+        build.arg(&out_ptr).arg(&gate_ptr).arg(up).arg(&n);
+
         unsafe {
             build.launch(cfg)?;
         }
@@ -403,5 +420,281 @@ impl Qwen2Model {
             builder.launch(cfg)?;
         }
         Ok(())
+    }
+}
+
+impl Qwen2Model {
+    pub fn forward(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        blas: &CudaBlas,
+        input_ids: &[u32],
+        cache_pos: usize,
+    ) -> Result<CudaSlice<bf16>> {
+        if input_ids.len() != 1 {
+            anyhow::bail!("Only support batch_size=1 and seq_len=1 for now");
+        }
+        let token_id = input_ids[0] as usize;
+        let hidden_dim = self.layers[0].input_layernorm.len();
+        // Qwen2.5-0.5B: hidden=896, heads=14 => head_dim=64
+        let head_dim = hidden_dim / 14;
+        let num_q_heads = 14;
+        let num_kv_heads = 2;
+        let group_size = num_q_heads / num_kv_heads;
+
+        // 1. Embedding
+        let embed_offset = token_id * hidden_dim;
+        let mut hidden_states = stream.alloc_zeros::<bf16>(hidden_dim)?;
+        {
+            let embed_view = self
+                .embed_tokens
+                .slice(embed_offset..embed_offset + hidden_dim);
+            stream.memcpy_dtod(&embed_view, &mut hidden_states)?;
+        }
+
+        // Pre-allocate buffers
+        let mut q_states = stream.alloc_zeros::<bf16>(hidden_dim)?;
+        let mut k_states = stream.alloc_zeros::<bf16>(num_kv_heads * head_dim)?;
+        let mut v_states = stream.alloc_zeros::<bf16>(num_kv_heads * head_dim)?;
+        let att_output = stream.alloc_zeros::<bf16>(hidden_dim)?;
+
+        // MLP Intermediate size = 4864
+        let intermediate_size = self.layers[0].gate_proj.len() / hidden_dim;
+        let mut mlp_buf_gate = stream.alloc_zeros::<bf16>(intermediate_size)?;
+        let mut mlp_buf_up = stream.alloc_zeros::<bf16>(intermediate_size)?;
+
+        let mut norm_buffer = stream.alloc_zeros::<bf16>(hidden_dim)?;
+
+        // Attention Score Buffer: [GroupSize, SeqLen]
+        let max_scores_len = group_size * (cache_pos + 1);
+        let mut scores_buf = stream.alloc_zeros::<bf16>(max_scores_len)?;
+
+        let kv_cache_head_stride = self.kv_cache.max_seq_len * head_dim;
+        let kv_cache_layer_stride = num_kv_heads * kv_cache_head_stride;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            // --- Attention Block ---
+            // 1. RMSNorm
+            self.apply_rmsnorm(
+                stream,
+                &mut norm_buffer,
+                Some(&hidden_states),
+                &layer.input_layernorm,
+                1e-6,
+            )?;
+
+            // 2. QKV Proj
+            unsafe {
+                self.matmul_bf16(
+                    stream,
+                    blas,
+                    1,
+                    hidden_dim,
+                    hidden_dim,
+                    &norm_buffer,
+                    &layer.q_proj,
+                    &mut q_states,
+                    1.0,
+                    0.0,
+                )?;
+                self.matmul_bf16(
+                    stream,
+                    blas,
+                    1,
+                    num_kv_heads * head_dim,
+                    hidden_dim,
+                    &norm_buffer,
+                    &layer.k_proj,
+                    &mut k_states,
+                    1.0,
+                    0.0,
+                )?;
+                self.matmul_bf16(
+                    stream,
+                    blas,
+                    1,
+                    num_kv_heads * head_dim,
+                    hidden_dim,
+                    &norm_buffer,
+                    &layer.v_proj,
+                    &mut v_states,
+                    1.0,
+                    0.0,
+                )?;
+            }
+
+            // 3. RoPE
+            self.apply_rope(
+                stream,
+                &mut q_states,
+                &mut k_states,
+                cache_pos,
+                head_dim,
+                num_q_heads,
+                num_kv_heads,
+            )?;
+
+            // 4. Update KV Cache
+            self.kv_cache
+                .update(stream, i, cache_pos, &k_states, &v_states)?;
+
+            // 5. Attention (Manual Batching over KV Heads)
+            let layer_offset = i * kv_cache_layer_stride;
+            for kv_head in 0..num_kv_heads {
+                let q_start_head = kv_head * group_size;
+                let q_offset = q_start_head * head_dim;
+
+                let k_cache_ptr_offset = layer_offset + kv_head * kv_cache_head_stride;
+                // Pointer arithmetic for bf16 (2 bytes)
+                // Use device_ptr(stream).0
+                let k_cache_ptr =
+                    self.kv_cache.k.device_ptr(stream).0 + (k_cache_ptr_offset * 2) as u64;
+                let v_cache_ptr =
+                    self.kv_cache.v.device_ptr(stream).0 + (k_cache_ptr_offset * 2) as u64;
+
+                let q_sub = q_states.slice(q_offset..q_offset + group_size * head_dim);
+
+                let m = group_size;
+                let n = cache_pos + 1;
+                let k = head_dim;
+
+                let alpha = 1.0f32 / (head_dim as f32).sqrt();
+                let beta = 0.0f32;
+
+                // 5a. Q * K^T
+                unsafe {
+                    cublasGemmEx(
+                        *blas.handle(),
+                        cublasOperation_t::CUBLAS_OP_T,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        n as i32,
+                        m as i32,
+                        k as i32,
+                        &alpha as *const f32 as *const _,
+                        k_cache_ptr as *const _,
+                        cudaDataType::CUDA_R_16BF,
+                        k as i32,
+                        q_sub.device_ptr(stream).0 as *const _,
+                        cudaDataType::CUDA_R_16BF,
+                        k as i32,
+                        &beta as *const f32 as *const _,
+                        scores_buf.device_ptr(stream).0 as *mut _,
+                        cudaDataType::CUDA_R_16BF,
+                        n as i32,
+                        cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    );
+                }
+
+                // 5b. Softmax
+                self.apply_softmax(stream, &mut scores_buf, n, m)?;
+
+                // 5c. Score * V
+                let att_out_sub = att_output.slice(q_offset..q_offset + group_size * head_dim);
+                let alpha_v = 1.0f32;
+
+                unsafe {
+                    cublasGemmEx(
+                        *blas.handle(),
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        k as i32,
+                        m as i32,
+                        n as i32,
+                        &alpha_v as *const f32 as *const _,
+                        v_cache_ptr as *const _,
+                        cudaDataType::CUDA_R_16BF,
+                        k as i32,
+                        scores_buf.device_ptr(stream).0 as *const _,
+                        cudaDataType::CUDA_R_16BF,
+                        n as i32,
+                        &beta as *const f32 as *const _,
+                        att_out_sub.device_ptr(stream).0 as *mut _,
+                        cudaDataType::CUDA_R_16BF,
+                        k as i32,
+                        cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    );
+                }
+            }
+
+            // 6. Output Projection (accumulate to hidden_states for residual)
+            unsafe {
+                self.matmul_bf16(
+                    stream,
+                    blas,
+                    1,
+                    hidden_dim,
+                    hidden_dim,
+                    &att_output,
+                    &layer.o_proj,
+                    &mut hidden_states,
+                    1.0,
+                    1.0,
+                )?;
+            }
+
+            // --- MLP Block ---
+            // 7. RMSNorm (Post-Attn)
+            self.apply_rmsnorm(
+                stream,
+                &mut norm_buffer,
+                Some(&hidden_states),
+                &layer.post_attention_layernorm,
+                1e-6,
+            )?;
+
+            // 8. Gate & Up Proj
+            unsafe {
+                self.matmul_bf16(
+                    stream,
+                    blas,
+                    1,
+                    intermediate_size,
+                    hidden_dim,
+                    &norm_buffer,
+                    &layer.gate_proj,
+                    &mut mlp_buf_gate,
+                    1.0,
+                    0.0,
+                )?;
+                self.matmul_bf16(
+                    stream,
+                    blas,
+                    1,
+                    intermediate_size,
+                    hidden_dim,
+                    &norm_buffer,
+                    &layer.up_proj,
+                    &mut mlp_buf_up,
+                    1.0,
+                    0.0,
+                )?;
+            }
+
+            // 9. Activation (SiLU * Mul)
+            self.apply_activation(stream, &mut mlp_buf_gate, None, &mlp_buf_up)?;
+
+            // 10. Down Proj (accumulate to hidden_states for residual)
+            unsafe {
+                self.matmul_bf16(
+                    stream,
+                    blas,
+                    1,
+                    hidden_dim,
+                    intermediate_size,
+                    &mlp_buf_gate,
+                    &layer.down_proj,
+                    &mut hidden_states,
+                    1.0,
+                    1.0,
+                )?;
+            }
+        }
+
+        // Final Norm
+        self.apply_rmsnorm(stream, &mut hidden_states, None, &self.final_norm, 1e-6)?;
+
+        Ok(hidden_states)
     }
 }
