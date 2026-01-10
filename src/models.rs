@@ -1,10 +1,15 @@
+mod ptx;
+
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig};
+use cudarc::nvrtc::Ptx;
 use half::bf16;
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use serde::Deserialize;
 use std::{fs::File, path::Path, sync::Arc};
+
+use crate::models::ptx::KV_CACHE_PTX;
 
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
@@ -13,6 +18,7 @@ pub struct ModelConfig {
     pub num_hidden_layers: usize,
     pub hidden_size: usize,
     pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
 }
@@ -35,11 +41,22 @@ pub struct Qwen2Model {
     pub layers: Vec<LayerWeights>,
     pub final_norm: CudaSlice<bf16>,
     pub rope: RopeCache,
+    pub kv_cache: KVCache,
 }
 
 pub struct RopeCache {
     pub cos: CudaSlice<f32>,
     pub sin: CudaSlice<f32>,
+}
+
+pub struct KVCache {
+    pub k: CudaSlice<bf16>,
+    pub v: CudaSlice<bf16>,
+    pub max_seq_len: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub num_layers: usize,
+    cuda_function: CudaFunction,
 }
 
 impl Qwen2Model {
@@ -97,12 +114,14 @@ impl Qwen2Model {
             head_dim,
             config.rope_theta,
         )?;
+        let kv_cache = KVCache::new(device, &stream, &config)?;
 
         Ok(Qwen2Model {
             embed_tokens,
             layers,
             final_norm,
             rope,
+            kv_cache,
         })
     }
 }
@@ -147,4 +166,76 @@ impl RopeCache {
             sin: sin_dev,
         })
     }
+}
+
+impl KVCache {
+    pub fn new(
+        context: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        config: &ModelConfig,
+    ) -> Result<Self> {
+        let head_dim = config.hidden_size / config.num_attention_heads;
+        let size = config.num_hidden_layers
+            * config.num_key_value_heads
+            * config.max_position_embeddings
+            * head_dim;
+        let k = stream.alloc_zeros::<bf16>(size)?;
+        let v = stream.alloc_zeros::<bf16>(size)?;
+        let cuda_function = {
+            let ptx = Ptx::from_src(KV_CACHE_PTX);
+            let module = context.load_module(ptx)?;
+            module.load_function("update_kv_cache_kernel")?
+        };
+        Ok(KVCache {
+            k,
+            v,
+            max_seq_len: config.max_position_embeddings,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim,
+            num_layers: config.num_hidden_layers,
+            cuda_function,
+        })
+    }
+
+    // pub fn update(
+    //     &self,
+    //     stream: &Arc<CudaStream>,
+    //     layer_idx: usize,
+    //     pos: usize,
+    //     k_input: &CudaSlice<bf16>,
+    //     v_input: &CudaSlice<bf16>,
+    // ) -> Result<()> {
+    //     let module_name = "kv_cache";
+    //     let func_name = "update_kv_cache_kernel";
+    //     let dev = stream.device();
+
+    //     if !dev.has_func(module_name, func_name) {
+    //         let ptx_path = "src/kernels/kv_cache.ptx";
+    //         let ptx = Ptx::from_file(ptx_path);
+    //         dev.load_ptx(ptx, module_name, &[func_name])?;
+    //     }
+
+    //     let func = dev.get_func(module_name, func_name).unwrap();
+    //     let cfg = LaunchConfig::for_num_elems(self.num_kv_heads as u32);
+
+    //     unsafe {
+    //         func.launch_on_stream(
+    //             stream,
+    //             cfg,
+    //             (
+    //                 &self.k,
+    //                 &self.v,
+    //                 k_input,
+    //                 v_input,
+    //                 layer_idx as i32,
+    //                 pos as i32,
+    //                 self.num_layers as i32,
+    //                 self.num_kv_heads as i32,
+    //                 self.max_seq_len as i32,
+    //                 self.head_dim as i32,
+    //             ),
+    //         )
+    //     }?;
+    //     Ok(())
+    // }
 }

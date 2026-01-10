@@ -1,4 +1,3 @@
-#include <cmath>
 #include <cuda_bf16.h>
 
 // 基础的 SiLU 函数
