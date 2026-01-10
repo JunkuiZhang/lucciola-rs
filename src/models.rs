@@ -1,7 +1,11 @@
-mod ptx;
-
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig};
+use cudarc::cublas::sys::{
+    cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
+};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::Ptx;
 use half::bf16;
 use memmap2::MmapOptions;
@@ -9,7 +13,8 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 use std::{fs::File, path::Path, sync::Arc};
 
-use crate::models::ptx::KV_CACHE_PTX;
+use crate::kernels::{CudaFunctions, load_cuda_funtion};
+use crate::ptx::KV_CACHE_PTX;
 
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
@@ -33,7 +38,10 @@ pub struct LayerWeights {
     pub k_proj: CudaSlice<bf16>,
     pub v_proj: CudaSlice<bf16>,
     pub o_proj: CudaSlice<bf16>,
-    // TODO: Add other weights
+    pub post_attention_layernorm: CudaSlice<bf16>,
+    pub gate_proj: CudaSlice<bf16>,
+    pub up_proj: CudaSlice<bf16>,
+    pub down_proj: CudaSlice<bf16>,
 }
 
 pub struct Qwen2Model {
@@ -42,6 +50,7 @@ pub struct Qwen2Model {
     pub final_norm: CudaSlice<bf16>,
     pub rope: RopeCache,
     pub kv_cache: KVCache,
+    cuda_functions: CudaFunctions,
 }
 
 pub struct RopeCache {
@@ -101,6 +110,26 @@ impl Qwen2Model {
                     &tensors,
                     &format!("{}self_attn.o_proj.weight", layer_prefix),
                 )?,
+                post_attention_layernorm: get_tensor(
+                    &stream,
+                    &tensors,
+                    &format!("{}post_attention_layernorm.weight", layer_prefix),
+                )?,
+                gate_proj: get_tensor(
+                    &stream,
+                    &tensors,
+                    &format!("{}mlp.gate_proj.weight", layer_prefix),
+                )?,
+                up_proj: get_tensor(
+                    &stream,
+                    &tensors,
+                    &format!("{}mlp.up_proj.weight", layer_prefix),
+                )?,
+                down_proj: get_tensor(
+                    &stream,
+                    &tensors,
+                    &format!("{}mlp.down_proj.weight", layer_prefix),
+                )?,
             };
             layers.push(layer_weights);
         }
@@ -115,6 +144,7 @@ impl Qwen2Model {
             config.rope_theta,
         )?;
         let kv_cache = KVCache::new(device, &stream, &config)?;
+        let cuda_functions = CudaFunctions::load(device)?;
 
         Ok(Qwen2Model {
             embed_tokens,
@@ -122,6 +152,7 @@ impl Qwen2Model {
             final_norm,
             rope,
             kv_cache,
+            cuda_functions,
         })
     }
 }
@@ -181,11 +212,8 @@ impl KVCache {
             * head_dim;
         let k = stream.alloc_zeros::<bf16>(size)?;
         let v = stream.alloc_zeros::<bf16>(size)?;
-        let cuda_function = {
-            let ptx = Ptx::from_src(KV_CACHE_PTX);
-            let module = context.load_module(ptx)?;
-            module.load_function("update_kv_cache_kernel")?
-        };
+        let cuda_function = load_cuda_funtion(context, KV_CACHE_PTX, "update_kv_cache_kernel")?;
+
         Ok(KVCache {
             k,
             v,
@@ -197,45 +225,183 @@ impl KVCache {
         })
     }
 
-    // pub fn update(
-    //     &self,
-    //     stream: &Arc<CudaStream>,
-    //     layer_idx: usize,
-    //     pos: usize,
-    //     k_input: &CudaSlice<bf16>,
-    //     v_input: &CudaSlice<bf16>,
-    // ) -> Result<()> {
-    //     let module_name = "kv_cache";
-    //     let func_name = "update_kv_cache_kernel";
-    //     let dev = stream.device();
+    pub fn update(
+        &self,
+        stream: &Arc<CudaStream>,
+        layer_idx: usize,
+        pos: usize,
+        k_input: &CudaSlice<bf16>,
+        v_input: &CudaSlice<bf16>,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems(self.num_kv_heads as u32);
+        let mut builder = stream.launch_builder(&self.cuda_function);
+        let layer_idx = layer_idx as i32;
+        let pos = pos as i32;
+        let num_layers = self.num_layers as i32;
+        let num_kv_heads = self.num_kv_heads as i32;
+        let max_seq_len = self.max_seq_len as i32;
+        let head_dim = self.head_dim as i32;
+        builder
+            .arg(&self.k)
+            .arg(&self.v)
+            .arg(k_input)
+            .arg(v_input)
+            .arg(&layer_idx)
+            .arg(&pos)
+            .arg(&num_layers)
+            .arg(&num_kv_heads)
+            .arg(&max_seq_len)
+            .arg(&head_dim);
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+}
 
-    //     if !dev.has_func(module_name, func_name) {
-    //         let ptx_path = "src/kernels/kv_cache.ptx";
-    //         let ptx = Ptx::from_file(ptx_path);
-    //         dev.load_ptx(ptx, module_name, &[func_name])?;
-    //     }
+impl Qwen2Model {
+    unsafe fn matmul_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &CudaBlas,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &CudaSlice<bf16>,
+        b: &CudaSlice<bf16>,
+        c: &mut CudaSlice<bf16>,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<()> {
+        let m_blas = n as i32;
+        let n_blas = m as i32;
+        let k_blas = k as i32;
 
-    //     let func = dev.get_func(module_name, func_name).unwrap();
-    //     let cfg = LaunchConfig::for_num_elems(self.num_kv_heads as u32);
+        unsafe {
+            cublasGemmEx(
+                *blas.handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                m_blas,
+                n_blas,
+                k_blas,
+                &alpha as *const f32 as *const _,
+                b.device_ptr(stream).0 as *const _,
+                cudaDataType::CUDA_R_16BF,
+                k_blas,
+                a.device_ptr(stream).0 as *const _,
+                cudaDataType::CUDA_R_16BF,
+                k_blas,
+                &beta as *const f32 as *const _,
+                c.device_ptr(stream).0 as *mut _,
+                cudaDataType::CUDA_R_16BF,
+                m_blas,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            );
+        }
+        Ok(())
+    }
+}
 
-    //     unsafe {
-    //         func.launch_on_stream(
-    //             stream,
-    //             cfg,
-    //             (
-    //                 &self.k,
-    //                 &self.v,
-    //                 k_input,
-    //                 v_input,
-    //                 layer_idx as i32,
-    //                 pos as i32,
-    //                 self.num_layers as i32,
-    //                 self.num_kv_heads as i32,
-    //                 self.max_seq_len as i32,
-    //                 self.head_dim as i32,
-    //             ),
-    //         )
-    //     }?;
-    //     Ok(())
-    // }
+impl Qwen2Model {
+    fn apply_rmsnorm(
+        &self,
+        stream: &Arc<CudaStream>,
+        out: &mut CudaSlice<bf16>,
+        input: &CudaSlice<bf16>,
+        weight: &CudaSlice<bf16>,
+        epsilon: f32,
+    ) -> Result<()> {
+        let num_elements = input.len();
+        let num_cols = weight.len();
+        let num_rows = num_elements / num_cols;
+        let cfg = LaunchConfig {
+            grid_dim: (num_rows as u32, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let num_cols = num_cols as i32;
+        let mut build = stream.launch_builder(&self.cuda_functions.rmsnorm);
+        build
+            .arg(out)
+            .arg(input)
+            .arg(weight)
+            .arg(&epsilon)
+            .arg(&num_cols);
+        unsafe {
+            build.launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    fn apply_activation(
+        &self,
+        stream: &Arc<CudaStream>,
+        out: &mut CudaSlice<bf16>,
+        gate: &CudaSlice<bf16>,
+        up: &CudaSlice<bf16>,
+    ) -> Result<()> {
+        let n = out.len() as i32;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut build = stream.launch_builder(&self.cuda_functions.activation);
+        build.arg(out).arg(gate).arg(up).arg(&n);
+        unsafe {
+            build.launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    fn apply_rope(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: &mut CudaSlice<bf16>,
+        k: &mut CudaSlice<bf16>,
+        pos: usize,
+        head_dim: usize,
+        num_q_heads: usize,
+        num_k_heads: usize,
+    ) -> Result<()> {
+        let total_threads = num_q_heads * (head_dim / 2);
+        let cfg = LaunchConfig::for_num_elems(total_threads as u32);
+
+        let pos = pos as i32;
+        let head_dim = head_dim as i32;
+        let num_q_heads = num_q_heads as i32;
+        let num_k_heads = num_k_heads as i32;
+
+        let mut builder = stream.launch_builder(&self.cuda_functions.rope);
+        builder
+            .arg(q)
+            .arg(k)
+            .arg(&self.rope.cos)
+            .arg(&self.rope.sin)
+            .arg(&pos)
+            .arg(&head_dim)
+            .arg(&num_q_heads)
+            .arg(&num_k_heads);
+        unsafe {
+            builder.launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    fn apply_softmax(
+        &self,
+        stream: &Arc<CudaStream>,
+        logits: &mut CudaSlice<bf16>,
+        seq_len: usize,
+        num_heads: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads as u32, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_len = seq_len as u32;
+        let mut builder = stream.launch_builder(&self.cuda_functions.softmax);
+        builder.arg(logits).arg(&seq_len);
+        unsafe {
+            builder.launch(cfg)?;
+        }
+        Ok(())
+    }
 }

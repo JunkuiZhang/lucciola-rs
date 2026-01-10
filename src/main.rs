@@ -4,7 +4,9 @@ use tokenizers::Tokenizer;
 
 use crate::models::Qwen2Model;
 
+mod kernels;
 mod models;
+mod ptx;
 
 fn main() -> Result<()> {
     let device = CudaContext::new(0)?;
@@ -38,6 +40,6 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))?;
     println!("Decoded back: '{}'", decoded);
 
-    // std::thread::sleep(std::time::Duration::from_secs(5));
+    std::thread::sleep(std::time::Duration::from_secs(5));
     Ok(())
 }

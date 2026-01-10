@@ -25,6 +25,7 @@ fn main() {
     let dst_path = std::path::Path::new(&out_dir);
     let kernels = [
         "activation.cu",
+        "attention.cu",
         "kv_cache.cu",
         "rmsnorm.cu",
         "rope.cu",
