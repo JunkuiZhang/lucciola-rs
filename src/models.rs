@@ -23,6 +23,7 @@ pub struct ModelConfig {
     pub hidden_size: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    pub intermediate_size: usize,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
 }
@@ -53,7 +54,57 @@ pub struct Qwen2Model {
     pub final_norm: CudaSlice<bf16>,
     pub rope: RopeCache,
     pub kv_cache: KVCache,
+    pub buffers: InferenceBuffers,
     cuda_functions: CudaFunctions,
+}
+
+pub struct InferenceBuffers {
+    pub hidden_states: CudaSlice<bf16>,
+    pub q_states: CudaSlice<bf16>,
+    pub k_states: CudaSlice<bf16>,
+    pub v_states: CudaSlice<bf16>,
+    pub att_output: CudaSlice<bf16>,
+    pub mlp_gate: CudaSlice<bf16>,
+    pub mlp_up: CudaSlice<bf16>,
+    pub norm_buffer: CudaSlice<bf16>,
+    pub scores_buf: CudaSlice<bf16>,
+}
+
+impl InferenceBuffers {
+    fn new(stream: &Arc<CudaStream>, config: &ModelConfig) -> Result<Self> {
+        let hidden_dim = config.hidden_size;
+        let head_dim = hidden_dim / config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let intermediate_size = config.intermediate_size; // Or calculate it if not available
+
+        let hidden_states = stream.alloc_zeros::<bf16>(hidden_dim)?;
+        let q_states = stream.alloc_zeros::<bf16>(hidden_dim)?;
+        let k_states = stream.alloc_zeros::<bf16>(num_kv_heads * head_dim)?;
+        let v_states = stream.alloc_zeros::<bf16>(num_kv_heads * head_dim)?;
+        let att_output = stream.alloc_zeros::<bf16>(hidden_dim)?;
+
+        let mlp_gate = stream.alloc_zeros::<bf16>(intermediate_size)?;
+        let mlp_up = stream.alloc_zeros::<bf16>(intermediate_size)?;
+
+        let norm_buffer = stream.alloc_zeros::<bf16>(hidden_dim)?;
+
+        let num_q_heads = config.num_attention_heads;
+        let group_size = num_q_heads / num_kv_heads;
+        let max_scores_len = group_size * config.max_position_embeddings;
+        let scores_buf = stream.alloc_zeros::<bf16>(max_scores_len)?;
+
+        Ok(Self {
+            hidden_states,
+            q_states,
+            k_states,
+            v_states,
+            att_output,
+            mlp_gate,
+            mlp_up,
+            norm_buffer,
+            scores_buf,
+        })
+    }
 }
 
 pub struct RopeCache {
@@ -167,6 +218,7 @@ impl Qwen2Model {
         )?;
         let kv_cache = KVCache::new(device, &stream, &config)?;
         let cuda_functions = CudaFunctions::load(device)?;
+        let buffers = InferenceBuffers::new(&stream, &config)?;
 
         Ok(Qwen2Model {
             embed_tokens,
@@ -175,6 +227,7 @@ impl Qwen2Model {
             final_norm,
             rope,
             kv_cache,
+            buffers,
             cuda_functions,
         })
     }
@@ -288,7 +341,6 @@ impl KVCache {
 
 impl Qwen2Model {
     unsafe fn matmul_bf16(
-        &self,
         stream: &Arc<CudaStream>,
         blas: &CudaBlas,
         m: usize,
@@ -333,7 +385,7 @@ impl Qwen2Model {
 
 impl Qwen2Model {
     fn apply_rmsnorm(
-        &self,
+        cuda_functions: &CudaFunctions,
         stream: &Arc<CudaStream>,
         out: &mut CudaSlice<bf16>,
         input: Option<&CudaSlice<bf16>>,
@@ -357,7 +409,7 @@ impl Qwen2Model {
             out_ptr
         };
 
-        let mut build = stream.launch_builder(&self.cuda_functions.rmsnorm);
+        let mut build = stream.launch_builder(&cuda_functions.rmsnorm);
         build
             .arg(&out_ptr)
             .arg(&input_ptr)
@@ -372,7 +424,7 @@ impl Qwen2Model {
     }
 
     fn apply_activation(
-        &self,
+        cuda_functions: &CudaFunctions,
         stream: &Arc<CudaStream>,
         out: &mut CudaSlice<bf16>,
         gate: Option<&CudaSlice<bf16>>,
@@ -388,7 +440,7 @@ impl Qwen2Model {
             out_ptr
         };
 
-        let mut build = stream.launch_builder(&self.cuda_functions.activation);
+        let mut build = stream.launch_builder(&cuda_functions.activation);
         build.arg(&out_ptr).arg(&gate_ptr).arg(up).arg(&n);
 
         unsafe {
@@ -398,7 +450,8 @@ impl Qwen2Model {
     }
 
     fn apply_rope(
-        &self,
+        cuda_functions: &CudaFunctions,
+        rope: &RopeCache,
         stream: &Arc<CudaStream>,
         q: &mut CudaSlice<bf16>,
         q_bias: &CudaSlice<bf16>,
@@ -417,14 +470,14 @@ impl Qwen2Model {
         let num_q_heads = num_q_heads as i32;
         let num_k_heads = num_k_heads as i32;
 
-        let mut builder = stream.launch_builder(&self.cuda_functions.rope);
+        let mut builder = stream.launch_builder(&cuda_functions.rope);
         builder
             .arg(q)
             .arg(q_bias)
             .arg(k)
             .arg(k_bias)
-            .arg(&self.rope.cos)
-            .arg(&self.rope.sin)
+            .arg(&rope.cos)
+            .arg(&rope.sin)
             .arg(&pos)
             .arg(&head_dim)
             .arg(&num_q_heads)
@@ -436,7 +489,7 @@ impl Qwen2Model {
     }
 
     fn apply_softmax(
-        &self,
+        cuda_functions: &CudaFunctions,
         stream: &Arc<CudaStream>,
         logits: &mut CudaSlice<bf16>,
         seq_len: usize,
@@ -448,7 +501,7 @@ impl Qwen2Model {
             shared_mem_bytes: 0,
         };
         let seq_len = seq_len as u32;
-        let mut builder = stream.launch_builder(&self.cuda_functions.softmax);
+        let mut builder = stream.launch_builder(&cuda_functions.softmax);
         builder.arg(logits).arg(&seq_len);
         unsafe {
             builder.launch(cfg)?;
@@ -529,91 +582,81 @@ impl Qwen2Model {
 
         // 1. Embedding
         let embed_offset = token_id * hidden_dim;
-        let mut hidden_states = stream.alloc_zeros::<bf16>(hidden_dim)?;
+        // Reuse hidden_states buffer
         {
             let embed_view = self
                 .embed_tokens
                 .slice(embed_offset..embed_offset + hidden_dim);
-            stream.memcpy_dtod(&embed_view, &mut hidden_states)?;
+            stream.memcpy_dtod(&embed_view, &mut self.buffers.hidden_states)?;
         }
-
-        // Pre-allocate buffers
-        let mut q_states = stream.alloc_zeros::<bf16>(hidden_dim)?;
-        let mut k_states = stream.alloc_zeros::<bf16>(num_kv_heads * head_dim)?;
-        let mut v_states = stream.alloc_zeros::<bf16>(num_kv_heads * head_dim)?;
-        let att_output = stream.alloc_zeros::<bf16>(hidden_dim)?;
-
-        // MLP Intermediate size = 4864
-        let intermediate_size = self.layers[0].gate_proj.len() / hidden_dim;
-        let mut mlp_buf_gate = stream.alloc_zeros::<bf16>(intermediate_size)?;
-        let mut mlp_buf_up = stream.alloc_zeros::<bf16>(intermediate_size)?;
-
-        let mut norm_buffer = stream.alloc_zeros::<bf16>(hidden_dim)?;
-
-        // Attention Score Buffer: [GroupSize, SeqLen]
-        let max_scores_len = group_size * (cache_pos + 1);
-        let mut scores_buf = stream.alloc_zeros::<bf16>(max_scores_len)?;
 
         let kv_cache_head_stride = self.kv_cache.max_seq_len * head_dim;
         let kv_cache_layer_stride = num_kv_heads * kv_cache_head_stride;
 
+        let buffers = &mut self.buffers;
+        let funcs = &self.cuda_functions;
+        let rope = &self.rope;
+
         for (i, layer) in self.layers.iter().enumerate() {
             // --- Attention Block ---
             // 1. RMSNorm
-            self.apply_rmsnorm(
+            Self::apply_rmsnorm(
+                funcs,
                 stream,
-                &mut norm_buffer,
-                Some(&hidden_states),
+                &mut buffers.norm_buffer,
+                Some(&buffers.hidden_states),
                 &layer.input_layernorm,
                 1e-6,
             )?;
 
             // 2. QKV Proj
             unsafe {
-                self.matmul_bf16(
+                Self::matmul_bf16(
                     stream,
                     blas,
                     1,
                     hidden_dim,
                     hidden_dim,
-                    &norm_buffer,
+                    &buffers.norm_buffer,
                     &layer.q_proj,
-                    &mut q_states,
+                    &mut buffers.q_states,
                     1.0,
                     0.0,
                 )?;
-                self.matmul_bf16(
+                Self::matmul_bf16(
                     stream,
                     blas,
                     1,
                     num_kv_heads * head_dim,
                     hidden_dim,
-                    &norm_buffer,
+                    &buffers.norm_buffer,
                     &layer.k_proj,
-                    &mut k_states,
+                    &mut buffers.k_states,
                     1.0,
                     0.0,
                 )?;
-                self.matmul_bf16(
+                Self::matmul_bf16(
                     stream,
                     blas,
                     1,
                     num_kv_heads * head_dim,
                     hidden_dim,
-                    &norm_buffer,
+                    &buffers.norm_buffer,
                     &layer.v_proj,
-                    &mut v_states,
+                    &mut buffers.v_states,
                     1.0,
                     0.0,
                 )?;
             }
 
             // 3. RoPE (Fused Bias Add)
-            self.apply_rope(
+            Self::apply_rope(
+                funcs,
+                rope,
                 stream,
-                &mut q_states,
+                &mut buffers.q_states,
                 &layer.q_bias,
-                &mut k_states,
+                &mut buffers.k_states,
                 &layer.k_bias,
                 cache_pos,
                 head_dim,
@@ -622,8 +665,14 @@ impl Qwen2Model {
             )?;
 
             // 4. Update KV Cache (Fused V Bias Add)
-            self.kv_cache
-                .update(stream, i, cache_pos, &k_states, &v_states, &layer.v_bias)?;
+            self.kv_cache.update(
+                stream,
+                i,
+                cache_pos,
+                &buffers.k_states,
+                &buffers.v_states,
+                &layer.v_bias,
+            )?;
 
             // 5. Attention (Manual Batching over KV Heads)
             let layer_offset = i * kv_cache_layer_stride;
@@ -639,7 +688,9 @@ impl Qwen2Model {
                 let v_cache_ptr =
                     self.kv_cache.v.device_ptr(stream).0 + (k_cache_ptr_offset * 2) as u64;
 
-                let q_sub = q_states.slice(q_offset..q_offset + group_size * head_dim);
+                let q_sub = buffers
+                    .q_states
+                    .slice(q_offset..q_offset + group_size * head_dim);
 
                 let m = group_size;
                 let n = cache_pos + 1;
@@ -665,7 +716,7 @@ impl Qwen2Model {
                         cudaDataType::CUDA_R_16BF,
                         k as i32,
                         &beta as *const f32 as *const _,
-                        scores_buf.device_ptr(stream).0 as *mut _,
+                        buffers.scores_buf.device_ptr(stream).0 as *mut _,
                         cudaDataType::CUDA_R_16BF,
                         n as i32,
                         cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -674,10 +725,12 @@ impl Qwen2Model {
                 }
 
                 // 5b. Softmax
-                self.apply_softmax(stream, &mut scores_buf, n, m)?;
+                Self::apply_softmax(funcs, stream, &mut buffers.scores_buf, n, m)?;
 
                 // 5c. Score * V
-                let att_out_sub = att_output.slice(q_offset..q_offset + group_size * head_dim);
+                let att_out_sub = buffers
+                    .att_output
+                    .slice(q_offset..q_offset + group_size * head_dim);
                 let alpha_v = 1.0f32;
 
                 unsafe {
@@ -692,7 +745,7 @@ impl Qwen2Model {
                         v_cache_ptr as *const _,
                         cudaDataType::CUDA_R_16BF,
                         k as i32,
-                        scores_buf.device_ptr(stream).0 as *const _,
+                        buffers.scores_buf.device_ptr(stream).0 as *const _,
                         cudaDataType::CUDA_R_16BF,
                         n as i32,
                         &beta as *const f32 as *const _,
@@ -707,15 +760,15 @@ impl Qwen2Model {
 
             // 6. Output Projection (accumulate to hidden_states for residual)
             unsafe {
-                self.matmul_bf16(
+                Self::matmul_bf16(
                     stream,
                     blas,
                     1,
                     hidden_dim,
                     hidden_dim,
-                    &att_output,
+                    &buffers.att_output,
                     &layer.o_proj,
-                    &mut hidden_states,
+                    &mut buffers.hidden_states,
                     1.0,
                     1.0,
                 )?;
@@ -723,56 +776,58 @@ impl Qwen2Model {
 
             // --- MLP Block ---
             // 7. RMSNorm (Post-Attn)
-            self.apply_rmsnorm(
+            Self::apply_rmsnorm(
+                funcs,
                 stream,
-                &mut norm_buffer,
-                Some(&hidden_states),
+                &mut buffers.norm_buffer,
+                Some(&buffers.hidden_states),
                 &layer.post_attention_layernorm,
                 1e-6,
             )?;
 
             // 8. Gate & Up Proj
+            let intermediate_size = self.layers[0].gate_proj.len() / hidden_dim;
             unsafe {
-                self.matmul_bf16(
+                Self::matmul_bf16(
                     stream,
                     blas,
                     1,
                     intermediate_size,
                     hidden_dim,
-                    &norm_buffer,
+                    &buffers.norm_buffer,
                     &layer.gate_proj,
-                    &mut mlp_buf_gate,
+                    &mut buffers.mlp_gate,
                     1.0,
                     0.0,
                 )?;
-                self.matmul_bf16(
+                Self::matmul_bf16(
                     stream,
                     blas,
                     1,
                     intermediate_size,
                     hidden_dim,
-                    &norm_buffer,
+                    &buffers.norm_buffer,
                     &layer.up_proj,
-                    &mut mlp_buf_up,
+                    &mut buffers.mlp_up,
                     1.0,
                     0.0,
                 )?;
             }
 
             // 9. Activation (SiLU * Mul)
-            self.apply_activation(stream, &mut mlp_buf_gate, None, &mlp_buf_up)?;
+            Self::apply_activation(funcs, stream, &mut buffers.mlp_gate, None, &buffers.mlp_up)?;
 
             // 10. Down Proj (accumulate to hidden_states for residual)
             unsafe {
-                self.matmul_bf16(
+                Self::matmul_bf16(
                     stream,
                     blas,
                     1,
                     hidden_dim,
                     intermediate_size,
-                    &mlp_buf_gate,
+                    &buffers.mlp_gate,
                     &layer.down_proj,
-                    &mut hidden_states,
+                    &mut buffers.hidden_states,
                     1.0,
                     1.0,
                 )?;
@@ -780,12 +835,27 @@ impl Qwen2Model {
         }
 
         // Final Norm
-        self.apply_rmsnorm(stream, &mut hidden_states, None, &self.final_norm, 1e-6)?;
+        Self::apply_rmsnorm(
+            funcs,
+            stream,
+            &mut buffers.hidden_states,
+            None,
+            &self.final_norm,
+            1e-6,
+        )?;
 
         // Synchronize to ensure all temporary buffers (q_states, k_states, etc.)
         // are used before they are dropped and freed.
         stream.synchronize()?;
 
-        Ok(hidden_states)
+        // Return a NEW SLICE (copy) because current signature expects distinct return
+        // Ideally we should change signature to not return anything, but main.rs expects it.
+        // We will return a clone of the slice which is cheap (just a pointer view),
+        // BUT the content is in buffers.hidden_states.
+        // The original logic returned a new allocation.
+        // To be safe and compatible with main.rs which calls SAMPLE next:
+        // sample() takes hidden_states.
+        // We can just return buffers.hidden_states.clone() (View).
+        Ok(self.buffers.hidden_states.clone())
     }
 }
