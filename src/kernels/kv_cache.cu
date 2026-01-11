@@ -1,31 +1,53 @@
 #include <cuda_bf16.h>
 
 extern "C" __global__ void update_kv_cache_kernel(
-    __nv_bfloat16 *k_cache, // [num_layers, num_kv_heads, max_seq_len, head_dim]
-    __nv_bfloat16 *v_cache, // 同上
-    const __nv_bfloat16 *new_k, // 当前层新算的 k [num_kv_heads, head_dim]
-    const __nv_bfloat16 *new_v, // 当前层新算的 v [num_kv_heads, head_dim]
-    const __nv_bfloat16 *v_bias, int layer_id, int pos_id, int num_layers,
-    int num_kv_heads, int max_seq_len, int head_dim) {
-    int head_idx = blockIdx.x; // 对应哪个 KV 头
-    int dim_idx = threadIdx.x; // 对应维度
+    __nv_bfloat16 *k_pool, // Base Pointer to Paged Pool
+    __nv_bfloat16 *v_pool, const __nv_bfloat16 *new_k,
+    const __nv_bfloat16 *new_v, const __nv_bfloat16 *v_bias,
+    const int *block_table, // [max_num_blocks] mapping logical->physical
+    int layer_id, int pos_id, int num_layers, int num_kv_heads,
+    int max_seq_len, // Not strictly needed for addressing anymore, but maybe
+                     // for bound checking
+    int head_dim, int block_size) {
+    int head_idx = blockIdx.x; // kv_head
+    int dim_idx = threadIdx.x; // dim
 
     if (head_idx < num_kv_heads && dim_idx < head_dim) {
-        // 计算在大缓存中的偏移量
-        // 索引公式: layer * (heads * max_len * dim) + head * (max_len * dim) +
-        // pos * dim + dim_idx
-        long long layer_offset =
-            (long long)layer_id * num_kv_heads * max_seq_len * head_dim;
-        long long head_offset = (long long)head_idx * max_seq_len * head_dim;
-        long long pos_offset = (long long)pos_id * head_dim;
+        // 1. Calculate Logical Block and Offset
+        int logical_block_idx = pos_id / block_size;
+        int block_offset = pos_id % block_size;
 
-        long long cache_idx = layer_offset + head_offset + pos_offset + dim_idx;
+        // 2. Look up Physical Block
+        int physical_block_idx = block_table[logical_block_idx];
+
+        // 3. Calculate Physical Address in Pool
+        // Layout: [PhysicalBlock, NumLayers, NumKVHeads, BlockSize, HeadDim]
+        // Stride breakdown:
+        //  Block: NumLayers * NumKVHeads * BlockSize * HeadDim
+        //  Layer: NumKVHeads * BlockSize * HeadDim
+        //  Head:  BlockSize * HeadDim
+        //  Token: HeadDim
+        //  Dim:   1
+
+        long long stride_block =
+            (long long)num_layers * num_kv_heads * block_size * head_dim;
+        long long stride_layer =
+            (long long)num_kv_heads * block_size * head_dim;
+        long long stride_head = (long long)block_size * head_dim;
+
+        long long final_offset = (long long)physical_block_idx * stride_block +
+                                 (long long)layer_id * stride_layer +
+                                 (long long)head_idx * stride_head +
+                                 (long long)block_offset * head_dim + dim_idx;
+
         int new_idx = head_idx * head_dim + dim_idx;
 
-        k_cache[cache_idx] = new_k[new_idx];
+        // Write K
+        k_pool[final_offset] = new_k[new_idx];
 
+        // Write V (with Bias)
         float val_v = __bfloat162float(new_v[new_idx]);
         float bias = __bfloat162float(v_bias[new_idx]);
-        v_cache[cache_idx] = __float2bfloat16(val_v + bias);
+        v_pool[final_offset] = __float2bfloat16(val_v + bias);
     }
 }

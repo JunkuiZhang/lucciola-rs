@@ -59,7 +59,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    for _ in 0..100 {
+    for _ in 0..512 {
         model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
         cache_pos += 1;
 
