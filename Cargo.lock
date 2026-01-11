@@ -394,6 +394,7 @@ dependencies = [
  "cudarc",
  "half",
  "memmap2",
+ "rand",
  "safetensors",
  "serde",
  "serde_json",

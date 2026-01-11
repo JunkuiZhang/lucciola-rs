@@ -3,6 +3,7 @@ use cudarc::cublas::CudaBlas;
 use tokenizers::Tokenizer;
 
 use lucciola::models::Qwen2Model;
+use lucciola::sampler::Sampler;
 
 fn main() -> Result<()> {
     let device = cudarc::driver::CudaContext::new(0)?;
@@ -22,15 +23,18 @@ fn main() -> Result<()> {
     let mut model = Qwen2Model::load(&device, model_path)?;
     println!("Model loaded successfully.");
 
-    // 3. Encode input
-    let prompt = "Hello, AI!";
+    // 3. Configure Sampler (Temp=0.7, Top-P=0.9)
+    let mut sampler = Sampler::new(42, 0.7, 0.9, 0);
+
+    // 4. Encode input
+    let prompt = "请用一句话解释量子计算。";
     let encoding = tokenizer
         .encode(prompt, true)
         .map_err(|e| anyhow::anyhow!("Encoding failed: {}", e))?;
     let input_ids = encoding.get_ids();
     println!("Prompt: '{}' -> IDs: {:?}", prompt, input_ids);
 
-    // 4. Generation
+    // 5. Generation
     let stream = device.default_stream();
     let mut cache_pos = 0;
 
@@ -38,7 +42,7 @@ fn main() -> Result<()> {
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    // Prefill (process all tokens except the last one without sampling)
+    // Prefill
     for &id in input_ids.iter().take(input_ids.len() - 1) {
         let _ = model.forward(&stream, &blas, &[id], cache_pos)?;
         cache_pos += 1;
@@ -46,27 +50,21 @@ fn main() -> Result<()> {
 
     let mut next_token_id = *input_ids.last().unwrap(); // u32
 
-    for _ in 0..50 {
+    for _ in 0..100 {
         model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
         cache_pos += 1;
 
-        let logits = model.sample(&device, &stream, &blas)?;
+        let mut logits = model.sample(&device, &stream, &blas)?;
 
-        // Greedy sampling (Argmax)
-        let (id, _) = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap();
-        next_token_id = id as u32;
+        // Advanced Sampling
+        next_token_id = sampler.sample(&mut logits)?;
 
         let token = tokenizer.decode(&[next_token_id], true).unwrap();
         print!("{}", token);
         std::io::stdout().flush()?;
 
-        // Stop token (approximate for Qwen - <|endoftext|>)
+        // Stop tokens for Qwen
         if next_token_id == 151643 || next_token_id == 151645 {
-            // Check tokenizer special tokens
             break;
         }
     }
