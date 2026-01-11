@@ -4,7 +4,8 @@ use cudarc::cublas::sys::{
     cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
 };
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig,
+    PushKernelArg,
 };
 use half::bf16;
 use memmap2::MmapOptions;
@@ -308,8 +309,8 @@ impl KVCache {
         stream: &Arc<CudaStream>,
         layer_idx: usize,
         pos: usize,
-        k_input: &CudaSlice<bf16>,
-        v_input: &CudaSlice<bf16>,
+        k_input: &impl DevicePtr<bf16>,
+        v_input: &impl DevicePtr<bf16>,
         v_bias: &CudaSlice<bf16>,
     ) -> Result<()> {
         let cfg = LaunchConfig {
@@ -317,6 +318,10 @@ impl KVCache {
             block_dim: (self.head_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
+
+        let (k_ptr, _k_guard) = DevicePtr::device_ptr(k_input, stream);
+        let (v_ptr, _v_guard) = DevicePtr::device_ptr(v_input, stream);
+
         let mut builder = stream.launch_builder(&self.cuda_function);
         let layer_idx = layer_idx as i32;
         let pos = pos as i32;
@@ -327,8 +332,8 @@ impl KVCache {
         builder
             .arg(&self.k)
             .arg(&self.v)
-            .arg(k_input)
-            .arg(v_input)
+            .arg(&k_ptr)
+            .arg(&v_ptr)
             .arg(v_bias)
             .arg(&layer_idx)
             .arg(&pos)
@@ -455,9 +460,9 @@ impl Qwen2Model {
         cuda_functions: &CudaFunctions,
         rope: &RopeCache,
         stream: &Arc<CudaStream>,
-        q: &mut CudaSlice<bf16>,
+        q: &mut (impl DevicePtrMut<bf16> + DevicePtr<bf16>),
         q_bias: &CudaSlice<bf16>,
-        k: &mut CudaSlice<bf16>,
+        k: &mut (impl DevicePtrMut<bf16> + DevicePtr<bf16>),
         k_bias: &CudaSlice<bf16>,
         pos: usize,
         head_dim: usize,
@@ -472,11 +477,14 @@ impl Qwen2Model {
         let num_q_heads = num_q_heads as i32;
         let num_k_heads = num_k_heads as i32;
 
+        let (q_ptr, _q_guard) = DevicePtr::device_ptr(q, stream);
+        let (k_ptr, _k_guard) = DevicePtr::device_ptr(k, stream);
+
         let mut builder = stream.launch_builder(&cuda_functions.rope);
         builder
-            .arg(q)
+            .arg(&q_ptr)
             .arg(q_bias)
-            .arg(k)
+            .arg(&k_ptr)
             .arg(k_bias)
             .arg(&rope.cos)
             .arg(&rope.sin)
@@ -493,8 +501,8 @@ impl Qwen2Model {
     fn apply_flash_decoding(
         cuda_functions: &CudaFunctions,
         stream: &Arc<CudaStream>,
-        output: &mut CudaSlice<bf16>,
-        q: &CudaSlice<bf16>,
+        output: &mut (impl DevicePtrMut<bf16> + DevicePtr<bf16>),
+        q: &impl DevicePtr<bf16>,
         cache: &KVCache,
         layer_idx: usize,
         pos: usize,
@@ -518,9 +526,12 @@ impl Qwen2Model {
         let head_dim_i32 = head_dim as i32;
         let current_pos = pos as i32;
 
+        let (out_ptr, _out_guard) = DevicePtr::device_ptr(output, stream);
+        let (q_ptr, _q_guard) = DevicePtr::device_ptr(q, stream);
+
         builder
-            .arg(output)
-            .arg(q)
+            .arg(&out_ptr)
+            .arg(&q_ptr)
             .arg(&cache.k)
             .arg(&cache.v)
             .arg(&layer_idx)
@@ -596,191 +607,388 @@ impl Qwen2Model {
         input_ids: &[u32],
         cache_pos: usize,
     ) -> Result<()> {
-        if input_ids.len() != 1 {
-            anyhow::bail!("Only support batch_size=1 and seq_len=1 for now");
+        let seq_len = input_ids.len();
+        if seq_len == 0 {
+            return Ok(());
         }
-        let token_id = input_ids[0] as usize;
-        let hidden_dim = self.config.hidden_size;
 
+        let hidden_dim = self.config.hidden_size;
         let head_dim = hidden_dim / self.config.num_attention_heads;
         let num_q_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
+        let intermediate_size = self.config.intermediate_size;
 
-        // 1. Embedding
-        let embed_offset = token_id * hidden_dim;
-        // Reuse hidden_states buffer
-        {
-            let embed_view = self
-                .embed_tokens
-                .slice(embed_offset..embed_offset + hidden_dim);
-            stream.memcpy_dtod(&embed_view, &mut self.buffers.hidden_states)?;
-        }
-
-        let buffers = &mut self.buffers;
         let funcs = &self.cuda_functions;
         let rope = &self.rope;
 
+        if seq_len == 1 {
+            let token_id = input_ids[0] as usize;
+
+            // 1. Embedding
+            let embed_offset = token_id * hidden_dim;
+            {
+                let embed_view = self
+                    .embed_tokens
+                    .slice(embed_offset..embed_offset + hidden_dim);
+                stream.memcpy_dtod(&embed_view, &mut self.buffers.hidden_states)?;
+            }
+
+            let buffers = &mut self.buffers;
+
+            for (i, layer) in self.layers.iter().enumerate() {
+                // --- Attention Block ---
+                Self::apply_rmsnorm(
+                    funcs,
+                    stream,
+                    &mut buffers.norm_buffer,
+                    Some(&buffers.hidden_states),
+                    &layer.input_layernorm,
+                    1e-6,
+                )?;
+
+                unsafe {
+                    Self::matmul_bf16(
+                        stream,
+                        blas,
+                        1,
+                        hidden_dim,
+                        hidden_dim,
+                        &buffers.norm_buffer,
+                        &layer.q_proj,
+                        &mut buffers.q_states,
+                        1.0,
+                        0.0,
+                    )?;
+                    Self::matmul_bf16(
+                        stream,
+                        blas,
+                        1,
+                        num_kv_heads * head_dim,
+                        hidden_dim,
+                        &buffers.norm_buffer,
+                        &layer.k_proj,
+                        &mut buffers.k_states,
+                        1.0,
+                        0.0,
+                    )?;
+                    Self::matmul_bf16(
+                        stream,
+                        blas,
+                        1,
+                        num_kv_heads * head_dim,
+                        hidden_dim,
+                        &buffers.norm_buffer,
+                        &layer.v_proj,
+                        &mut buffers.v_states,
+                        1.0,
+                        0.0,
+                    )?;
+                }
+
+                Self::apply_rope(
+                    funcs,
+                    rope,
+                    stream,
+                    &mut buffers.q_states,
+                    &layer.q_bias,
+                    &mut buffers.k_states,
+                    &layer.k_bias,
+                    cache_pos,
+                    head_dim,
+                    num_q_heads,
+                    num_kv_heads,
+                )?;
+                self.kv_cache.update(
+                    stream,
+                    i,
+                    cache_pos,
+                    &buffers.k_states,
+                    &buffers.v_states,
+                    &layer.v_bias,
+                )?;
+                Self::apply_flash_decoding(
+                    funcs,
+                    stream,
+                    &mut buffers.att_output,
+                    &buffers.q_states,
+                    &self.kv_cache,
+                    i,
+                    cache_pos,
+                    head_dim,
+                    num_q_heads,
+                    num_kv_heads,
+                )?;
+
+                unsafe {
+                    Self::matmul_bf16(
+                        stream,
+                        blas,
+                        1,
+                        hidden_dim,
+                        hidden_dim,
+                        &buffers.att_output,
+                        &layer.o_proj,
+                        &mut buffers.hidden_states,
+                        1.0,
+                        1.0,
+                    )?;
+                }
+
+                // --- MLP Block ---
+                Self::apply_rmsnorm(
+                    funcs,
+                    stream,
+                    &mut buffers.norm_buffer,
+                    Some(&buffers.hidden_states),
+                    &layer.post_attention_layernorm,
+                    1e-6,
+                )?;
+
+                unsafe {
+                    Self::matmul_bf16(
+                        stream,
+                        blas,
+                        1,
+                        intermediate_size,
+                        hidden_dim,
+                        &buffers.norm_buffer,
+                        &layer.gate_proj,
+                        &mut buffers.mlp_gate,
+                        1.0,
+                        0.0,
+                    )?;
+                    Self::matmul_bf16(
+                        stream,
+                        blas,
+                        1,
+                        intermediate_size,
+                        hidden_dim,
+                        &buffers.norm_buffer,
+                        &layer.up_proj,
+                        &mut buffers.mlp_up,
+                        1.0,
+                        0.0,
+                    )?;
+                }
+
+                Self::apply_activation(
+                    funcs,
+                    stream,
+                    &mut buffers.mlp_gate,
+                    None,
+                    &buffers.mlp_up,
+                )?;
+
+                unsafe {
+                    Self::matmul_bf16(
+                        stream,
+                        blas,
+                        1,
+                        hidden_dim,
+                        intermediate_size,
+                        &buffers.mlp_gate,
+                        &layer.down_proj,
+                        &mut buffers.hidden_states,
+                        1.0,
+                        1.0,
+                    )?;
+                }
+            }
+
+            Self::apply_rmsnorm(
+                funcs,
+                stream,
+                &mut buffers.hidden_states,
+                None,
+                &self.final_norm,
+                1e-6,
+            )?;
+            stream.synchronize()?;
+            return Ok(());
+        }
+
+        // --- Batched Path (SeqLen > 1) ---
+        let mut hidden_states = stream.alloc_zeros::<bf16>(seq_len * hidden_dim)?;
+
+        // 1. Batched Embedding
+        for (t, &id) in input_ids.iter().enumerate() {
+            let offset = t * hidden_dim; // Destination offset (row t)
+            let embed_offset = (id as usize) * hidden_dim;
+            let embed_view = self
+                .embed_tokens
+                .slice(embed_offset..embed_offset + hidden_dim);
+            let mut hidden_sub = hidden_states.slice_mut(offset..offset + hidden_dim);
+            stream.memcpy_dtod(&embed_view, &mut hidden_sub)?;
+        }
+
+        // Allocate Batched Buffers
+        let mut norm_buffer = stream.alloc_zeros::<bf16>(seq_len * hidden_dim)?;
+        let mut q_states = stream.alloc_zeros::<bf16>(seq_len * hidden_dim)?;
+        let mut k_states = stream.alloc_zeros::<bf16>(seq_len * num_kv_heads * head_dim)?;
+        let mut v_states = stream.alloc_zeros::<bf16>(seq_len * num_kv_heads * head_dim)?;
+        let mut att_output = stream.alloc_zeros::<bf16>(seq_len * hidden_dim)?;
+        let mut mlp_gate = stream.alloc_zeros::<bf16>(seq_len * intermediate_size)?;
+        let mut mlp_up = stream.alloc_zeros::<bf16>(seq_len * intermediate_size)?;
+
         for (i, layer) in self.layers.iter().enumerate() {
-            // --- Attention Block ---
             // 1. RMSNorm
             Self::apply_rmsnorm(
                 funcs,
                 stream,
-                &mut buffers.norm_buffer,
-                Some(&buffers.hidden_states),
+                &mut norm_buffer,
+                Some(&hidden_states),
                 &layer.input_layernorm,
                 1e-6,
             )?;
 
-            // 2. QKV Proj
+            // 2. Batched QKV Proj
             unsafe {
                 Self::matmul_bf16(
                     stream,
                     blas,
-                    1,
+                    seq_len,
                     hidden_dim,
                     hidden_dim,
-                    &buffers.norm_buffer,
+                    &norm_buffer,
                     &layer.q_proj,
-                    &mut buffers.q_states,
+                    &mut q_states,
                     1.0,
                     0.0,
                 )?;
                 Self::matmul_bf16(
                     stream,
                     blas,
-                    1,
+                    seq_len,
                     num_kv_heads * head_dim,
                     hidden_dim,
-                    &buffers.norm_buffer,
+                    &norm_buffer,
                     &layer.k_proj,
-                    &mut buffers.k_states,
+                    &mut k_states,
                     1.0,
                     0.0,
                 )?;
                 Self::matmul_bf16(
                     stream,
                     blas,
-                    1,
+                    seq_len,
                     num_kv_heads * head_dim,
                     hidden_dim,
-                    &buffers.norm_buffer,
+                    &norm_buffer,
                     &layer.v_proj,
-                    &mut buffers.v_states,
+                    &mut v_states,
                     1.0,
                     0.0,
                 )?;
             }
 
-            // 3. RoPE (Fused Bias Add)
-            Self::apply_rope(
-                funcs,
-                rope,
-                stream,
-                &mut buffers.q_states,
-                &layer.q_bias,
-                &mut buffers.k_states,
-                &layer.k_bias,
-                cache_pos,
-                head_dim,
-                num_q_heads,
-                num_kv_heads,
-            )?;
+            // 3. Serial Loop for Attention/RoPE/Cache
+            for t in 0..seq_len {
+                let current_pos = cache_pos + t;
+                let q_offset = t * hidden_dim;
+                let k_offset = t * num_kv_heads * head_dim;
+                let v_offset = t * num_kv_heads * head_dim;
 
-            // 4. Update KV Cache (Fused V Bias Add)
-            self.kv_cache.update(
-                stream,
-                i,
-                cache_pos,
-                &buffers.k_states,
-                &buffers.v_states,
-                &layer.v_bias,
-            )?;
+                let mut q_sub = q_states.slice_mut(q_offset..q_offset + hidden_dim);
+                let mut k_sub = k_states.slice_mut(k_offset..k_offset + num_kv_heads * head_dim);
+                let v_sub = v_states.slice(v_offset..v_offset + num_kv_heads * head_dim);
 
-            // 5. Attention (Fused Flash Decoding)
-            Self::apply_flash_decoding(
-                funcs,
-                stream,
-                &mut buffers.att_output,
-                &buffers.q_states,
-                &self.kv_cache,
-                i,
-                cache_pos,
-                head_dim,
-                num_q_heads,
-                num_kv_heads,
-            )?;
+                // RoPE & KV Update & Attention
+                Self::apply_rope(
+                    funcs,
+                    rope,
+                    stream,
+                    &mut q_sub,
+                    &layer.q_bias,
+                    &mut k_sub,
+                    &layer.k_bias,
+                    current_pos,
+                    head_dim,
+                    num_q_heads,
+                    num_kv_heads,
+                )?;
+                self.kv_cache
+                    .update(stream, i, current_pos, &k_sub, &v_sub, &layer.v_bias)?;
 
-            // 6. Output Projection (accumulate to hidden_states for residual)
+                let mut att_sub = att_output.slice_mut(q_offset..q_offset + hidden_dim);
+                Self::apply_flash_decoding(
+                    funcs,
+                    stream,
+                    &mut att_sub,
+                    &q_sub,
+                    &self.kv_cache,
+                    i,
+                    current_pos,
+                    head_dim,
+                    num_q_heads,
+                    num_kv_heads,
+                )?;
+            }
+
+            // 4. Batched Output Proj
             unsafe {
                 Self::matmul_bf16(
                     stream,
                     blas,
-                    1,
+                    seq_len,
                     hidden_dim,
                     hidden_dim,
-                    &buffers.att_output,
+                    &att_output,
                     &layer.o_proj,
-                    &mut buffers.hidden_states,
+                    &mut hidden_states,
                     1.0,
                     1.0,
                 )?;
             }
 
-            // --- MLP Block ---
-            // 7. RMSNorm (Post-Attn)
+            // --- Batched MLP ---
             Self::apply_rmsnorm(
                 funcs,
                 stream,
-                &mut buffers.norm_buffer,
-                Some(&buffers.hidden_states),
+                &mut norm_buffer,
+                Some(&hidden_states),
                 &layer.post_attention_layernorm,
                 1e-6,
             )?;
 
-            // 8. Gate & Up Proj
-            let intermediate_size = self.config.intermediate_size;
             unsafe {
                 Self::matmul_bf16(
                     stream,
                     blas,
-                    1,
+                    seq_len,
                     intermediate_size,
                     hidden_dim,
-                    &buffers.norm_buffer,
+                    &norm_buffer,
                     &layer.gate_proj,
-                    &mut buffers.mlp_gate,
+                    &mut mlp_gate,
                     1.0,
                     0.0,
                 )?;
                 Self::matmul_bf16(
                     stream,
                     blas,
-                    1,
+                    seq_len,
                     intermediate_size,
                     hidden_dim,
-                    &buffers.norm_buffer,
+                    &norm_buffer,
                     &layer.up_proj,
-                    &mut buffers.mlp_up,
+                    &mut mlp_up,
                     1.0,
                     0.0,
                 )?;
             }
 
-            // 9. Activation (SiLU * Mul)
-            Self::apply_activation(funcs, stream, &mut buffers.mlp_gate, None, &buffers.mlp_up)?;
+            Self::apply_activation(funcs, stream, &mut mlp_gate, None, &mlp_up)?;
 
-            // 10. Down Proj (accumulate to hidden_states for residual)
             unsafe {
                 Self::matmul_bf16(
                     stream,
                     blas,
-                    1,
+                    seq_len,
                     hidden_dim,
                     intermediate_size,
-                    &buffers.mlp_gate,
+                    &mlp_gate,
                     &layer.down_proj,
-                    &mut buffers.hidden_states,
+                    &mut hidden_states,
                     1.0,
                     1.0,
                 )?;
@@ -791,14 +999,17 @@ impl Qwen2Model {
         Self::apply_rmsnorm(
             funcs,
             stream,
-            &mut buffers.hidden_states,
+            &mut hidden_states,
             None,
             &self.final_norm,
             1e-6,
         )?;
 
-        // Synchronize to ensure all temporary buffers (q_states, k_states, etc.)
-        // are used before they are dropped and freed.
+        // Extract last token state
+        let last_offset = (seq_len - 1) * hidden_dim;
+        let last_token_state = hidden_states.slice(last_offset..last_offset + hidden_dim);
+        stream.memcpy_dtod(&last_token_state, &mut self.buffers.hidden_states)?;
+
         stream.synchronize()?;
         Ok(())
     }

@@ -23,8 +23,8 @@ fn main() -> Result<()> {
     let mut model = Qwen2Model::load(&device, model_path)?;
     println!("Model loaded successfully.");
 
-    // 3. Configure Sampler (Temp=0.7, Top-P=0.9)
-    let mut sampler = Sampler::new(42, 0.7, 0.9, 0);
+    // 3. Configure Sampler (Temp=0.8, Top-P=0.9)
+    let mut sampler = Sampler::new(42, 0.8, 0.9, 0);
 
     // 4. Encode input
     let prompt = "请用一句话解释量子计算。";
@@ -42,21 +42,28 @@ fn main() -> Result<()> {
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    // Prefill
-    for &id in input_ids.iter().take(input_ids.len() - 1) {
-        let _ = model.forward(&stream, &blas, &[id], cache_pos)?;
-        cache_pos += 1;
-    }
+    // Prefill (Batched)
+    model.forward(&stream, &blas, input_ids, cache_pos)?;
+    cache_pos += input_ids.len();
 
-    let mut next_token_id = *input_ids.last().unwrap(); // u32
+    // Sample first token
+    let mut logits = model.sample(&device, &stream, &blas)?;
+    let mut next_token_id = sampler.sample(&mut logits)?;
+
+    let token = tokenizer.decode(&[next_token_id], true).unwrap();
+    print!("{}", token);
+    std::io::stdout().flush()?;
+
+    if next_token_id == 151643 || next_token_id == 151645 {
+        println!();
+        return Ok(());
+    }
 
     for _ in 0..100 {
         model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
         cache_pos += 1;
 
         let mut logits = model.sample(&device, &stream, &blas)?;
-
-        // Advanced Sampling
         next_token_id = sampler.sample(&mut logits)?;
 
         let token = tokenizer.decode(&[next_token_id], true).unwrap();
