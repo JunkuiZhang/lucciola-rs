@@ -16,10 +16,6 @@ fn main() {
         project_dir
     );
     println!("cargo:rerun-if-changed={}/src/kernels/rope.cu", project_dir);
-    println!(
-        "cargo:rerun-if-changed={}/src/kernels/softmax.cu",
-        project_dir
-    );
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dst_path = std::path::Path::new(&out_dir);
@@ -29,14 +25,12 @@ fn main() {
         "kv_cache.cu",
         "rmsnorm.cu",
         "rope.cu",
-        "softmax.cu",
     ];
     for kernel in kernels {
         let ptx_path = dst_path.join(format!("{}.ptx", kernel));
         if ptx_path.exists() {
             std::fs::remove_file(&ptx_path).unwrap();
         }
-        println!("cargo:warning=Compiled kernel to {:?}", ptx_path);
         let source = std::fs::read_to_string(format!("src/kernels/{}", kernel)).unwrap();
         let opts = CompileOptions {
             include_paths: vec!["/usr/local/cuda/include".to_string()],

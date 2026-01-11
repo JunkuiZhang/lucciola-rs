@@ -40,15 +40,15 @@ fn main() -> Result<()> {
 
     // Process all but last
     for &id in input_ids.iter().take(n_input - 1) {
-        let _ = model.forward(&stream, &blas, &[id], cache_pos)?;
+        model.forward(&stream, &blas, &[id], cache_pos)?;
         cache_pos += 1;
     }
 
     // Process last input token to get first output
     let last_input = *input_ids.last().unwrap();
-    let hidden = model.forward(&stream, &blas, &[last_input], cache_pos)?;
+    model.forward(&stream, &blas, &[last_input], cache_pos)?;
     cache_pos += 1;
-    let _logits = model.sample(&device, &stream, &blas, &hidden)?;
+    let _logits = model.sample(&device, &stream, &blas)?;
 
     stream.synchronize()?;
     let prefill_duration = start_prefill.elapsed();
@@ -67,10 +67,10 @@ fn main() -> Result<()> {
     let start_gen = Instant::now();
 
     for _ in 0..n_gen {
-        let hidden = model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
+        model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
         cache_pos += 1;
 
-        let logits = model.sample(&device, &stream, &blas, &hidden)?;
+        let logits = model.sample(&device, &stream, &blas)?;
 
         let (id, _) = logits
             .iter()

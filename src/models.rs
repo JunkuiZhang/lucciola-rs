@@ -56,6 +56,7 @@ pub struct Qwen2Model {
     pub kv_cache: KVCache,
     pub buffers: InferenceBuffers,
     cuda_functions: CudaFunctions,
+    config: ModelConfig,
 }
 
 pub struct InferenceBuffers {
@@ -217,7 +218,7 @@ impl Qwen2Model {
             config.rope_theta,
         )?;
         let kv_cache = KVCache::new(device, &stream, &config)?;
-        let cuda_functions = CudaFunctions::load(device)?;
+        let cuda_functions = CudaFunctions::load(device, head_dim)?;
         let buffers = InferenceBuffers::new(&stream, &config)?;
 
         Ok(Qwen2Model {
@@ -229,6 +230,7 @@ impl Qwen2Model {
             kv_cache,
             buffers,
             cuda_functions,
+            config,
         })
     }
 }
@@ -488,41 +490,19 @@ impl Qwen2Model {
         Ok(())
     }
 
-    fn apply_softmax(
-        cuda_functions: &CudaFunctions,
-        stream: &Arc<CudaStream>,
-        logits: &mut CudaSlice<bf16>,
-        seq_len: usize,
-        num_heads: usize,
-    ) -> Result<()> {
-        let cfg = LaunchConfig {
-            grid_dim: (num_heads as u32, 1, 1),
-            block_dim: (1024, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let seq_len = seq_len as u32;
-        let mut builder = stream.launch_builder(&cuda_functions.softmax);
-        builder.arg(logits).arg(&seq_len);
-        unsafe {
-            builder.launch(cfg)?;
-        }
-        Ok(())
-    }
-
     fn apply_flash_decoding(
         cuda_functions: &CudaFunctions,
         stream: &Arc<CudaStream>,
         output: &mut CudaSlice<bf16>,
         q: &CudaSlice<bf16>,
-        k_cache: &KVCache,
-        v_cache: &KVCache,
+        cache: &KVCache,
         layer_idx: usize,
         pos: usize,
         head_dim: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
     ) -> Result<()> {
-        let max_seq_len = k_cache.max_seq_len as i32;
+        let max_seq_len = cache.max_seq_len as i32;
         let scale = 1.0 / (head_dim as f32).sqrt();
         let cfg = LaunchConfig {
             grid_dim: (num_q_heads as u32, 1, 1),
@@ -530,13 +510,7 @@ impl Qwen2Model {
             shared_mem_bytes: (head_dim as u32) * 4,
         };
 
-        let kernel = match head_dim {
-            64 => &cuda_functions.attention_64,
-            128 => &cuda_functions.attention_128,
-            _ => anyhow::bail!("Unsupported head_dim: {}", head_dim),
-        };
-
-        let mut builder = stream.launch_builder(kernel);
+        let mut builder = stream.launch_builder(&cuda_functions.attention);
 
         let layer_idx = layer_idx as i32;
         let num_q_heads_i32 = num_q_heads as i32;
@@ -547,8 +521,8 @@ impl Qwen2Model {
         builder
             .arg(output)
             .arg(q)
-            .arg(&k_cache.k)
-            .arg(&k_cache.v)
+            .arg(&cache.k)
+            .arg(&cache.v)
             .arg(&layer_idx)
             .arg(&num_q_heads_i32)
             .arg(&num_kv_heads_i32)
@@ -570,10 +544,9 @@ impl Qwen2Model {
         _device: &CudaContext,
         stream: &Arc<CudaStream>,
         blas: &CudaBlas,
-        hidden_states: &CudaSlice<bf16>,
     ) -> Result<Vec<f32>> {
-        let hidden_dim = hidden_states.len();
-        let vocab_size = self.lm_head.len() / hidden_dim;
+        let vocab_size = self.config.vocab_size;
+        let hidden_dim = self.config.hidden_size;
         let logits = stream.alloc_zeros::<bf16>(vocab_size)?;
 
         // C = A * B
@@ -598,7 +571,7 @@ impl Qwen2Model {
                 self.lm_head.device_ptr(stream).0 as *const _,
                 cudaDataType::CUDA_R_16BF,
                 hidden_dim as i32, // lda
-                hidden_states.device_ptr(stream).0 as *const _,
+                self.buffers.hidden_states.device_ptr(stream).0 as *const _,
                 cudaDataType::CUDA_R_16BF,
                 hidden_dim as i32, // ldb
                 &beta as *const f32 as *const _,
@@ -622,17 +595,16 @@ impl Qwen2Model {
         blas: &CudaBlas,
         input_ids: &[u32],
         cache_pos: usize,
-    ) -> Result<CudaSlice<bf16>> {
+    ) -> Result<()> {
         if input_ids.len() != 1 {
             anyhow::bail!("Only support batch_size=1 and seq_len=1 for now");
         }
         let token_id = input_ids[0] as usize;
-        let hidden_dim = self.layers[0].input_layernorm.len();
-        // Qwen2.5-0.5B: hidden=896, heads=14 => head_dim=64
-        let head_dim = hidden_dim / 14;
-        let num_q_heads = 14;
-        let num_kv_heads = 2;
-        let group_size = num_q_heads / num_kv_heads;
+        let hidden_dim = self.config.hidden_size;
+
+        let head_dim = hidden_dim / self.config.num_attention_heads;
+        let num_q_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
 
         // 1. Embedding
         let embed_offset = token_id * hidden_dim;
@@ -643,9 +615,6 @@ impl Qwen2Model {
                 .slice(embed_offset..embed_offset + hidden_dim);
             stream.memcpy_dtod(&embed_view, &mut self.buffers.hidden_states)?;
         }
-
-        let kv_cache_head_stride = self.kv_cache.max_seq_len * head_dim;
-        let kv_cache_layer_stride = num_kv_heads * kv_cache_head_stride;
 
         let buffers = &mut self.buffers;
         let funcs = &self.cuda_functions;
@@ -735,7 +704,6 @@ impl Qwen2Model {
                 &mut buffers.att_output,
                 &buffers.q_states,
                 &self.kv_cache,
-                &self.kv_cache,
                 i,
                 cache_pos,
                 head_dim,
@@ -771,7 +739,7 @@ impl Qwen2Model {
             )?;
 
             // 8. Gate & Up Proj
-            let intermediate_size = self.layers[0].gate_proj.len() / hidden_dim;
+            let intermediate_size = self.config.intermediate_size;
             unsafe {
                 Self::matmul_bf16(
                     stream,
@@ -832,15 +800,6 @@ impl Qwen2Model {
         // Synchronize to ensure all temporary buffers (q_states, k_states, etc.)
         // are used before they are dropped and freed.
         stream.synchronize()?;
-
-        // Return a NEW SLICE (copy) because current signature expects distinct return
-        // Ideally we should change signature to not return anything, but main.rs expects it.
-        // We will return a clone of the slice which is cheap (just a pointer view),
-        // BUT the content is in buffers.hidden_states.
-        // The original logic returned a new allocation.
-        // To be safe and compatible with main.rs which calls SAMPLE next:
-        // sample() takes hidden_states.
-        // We can just return buffers.hidden_states.clone() (View).
-        Ok(self.buffers.hidden_states.clone())
+        Ok(())
     }
 }

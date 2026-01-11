@@ -47,10 +47,10 @@ fn main() -> Result<()> {
     let mut next_token_id = *input_ids.last().unwrap(); // u32
 
     for _ in 0..50 {
-        let hidden = model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
+        model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
         cache_pos += 1;
 
-        let logits = model.sample(&device, &stream, &blas, &hidden)?;
+        let logits = model.sample(&device, &stream, &blas)?;
 
         // Greedy sampling (Argmax)
         let (id, _) = logits
