@@ -1,5 +1,4 @@
 use anyhow::Result;
-use cudarc::cublas::CudaBlas;
 use tokenizers::Tokenizer;
 
 use lucciola::chat::ChatTemplate;
@@ -7,9 +6,6 @@ use lucciola::models::Qwen2Model;
 use lucciola::sampler::Sampler;
 
 fn main() -> Result<()> {
-    let device = cudarc::driver::CudaContext::new(0)?;
-    let blas = CudaBlas::new(device.default_stream())?;
-
     let model_path = "/app/lucciola/models/Qwen2.5-0.5B-Instruct";
 
     // 1. Load Tokenizer
@@ -21,7 +17,7 @@ fn main() -> Result<()> {
     );
 
     // 2. Load Model
-    let mut model = Qwen2Model::load(&device, model_path)?;
+    let mut model = Qwen2Model::load(0, model_path)?;
     println!("Model loaded successfully.");
 
     // 3. Configure Sampler (Temp=0.8, Top-P=0.9)
@@ -37,50 +33,17 @@ fn main() -> Result<()> {
     println!("Prompt: '{}'", "请用一句话解释量子计算。");
 
     // 5. Generation
-    let stream = device.default_stream();
-    let mut cache_pos = 0;
-
     print!("Response: ");
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    // Prefill (Batched)
-    model.forward(&stream, &blas, &input_ids, cache_pos)?;
-    cache_pos += input_ids.len();
-
-    // Sample first token
-    let mut logits = model.sample(&device, &stream, &blas)?;
-    let mut next_token_id = sampler.sample(&mut logits)?;
-
-    let token = tokenizer.decode(&[next_token_id], true).unwrap();
-    print!("{}", token);
-    std::io::stdout().flush()?;
-
-    let eos_token_id = model.config.eos_token_id;
-    let bos_token_id = model.config.bos_token_id;
-
-    // Some models use BOS (like <|endoftext|>) as a stop token in certain contexts or as a fallback
-    if next_token_id == eos_token_id || next_token_id == bos_token_id {
-        println!();
-        return Ok(());
-    }
-
-    for _ in 0..512 {
-        model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
-        cache_pos += 1;
-
-        let mut logits = model.sample(&device, &stream, &blas)?;
-        next_token_id = sampler.sample(&mut logits)?;
-
-        let token = tokenizer.decode(&[next_token_id], true).unwrap();
-        print!("{}", token);
-        std::io::stdout().flush()?;
-
-        // Stop tokens
-        if next_token_id == eos_token_id || next_token_id == bos_token_id {
-            break;
+    model.generate(&input_ids, &mut sampler, 512, |token_id| {
+        if let Ok(token) = tokenizer.decode(&[token_id], true) {
+            print!("{}", token);
+            let _ = std::io::stdout().flush();
         }
-    }
+        true // continue
+    })?;
     println!();
 
     Ok(())

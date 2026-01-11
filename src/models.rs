@@ -52,6 +52,8 @@ pub struct LayerWeights {
 }
 
 pub struct Qwen2Model {
+    pub device: Arc<CudaContext>,
+    pub blas: Arc<CudaBlas>,
     pub embed_tokens: CudaSlice<bf16>,
     pub lm_head: CudaSlice<bf16>,
     pub layers: Vec<LayerWeights>,
@@ -133,7 +135,10 @@ pub struct KVCache {
 }
 
 impl Qwen2Model {
-    pub fn load(device: &Arc<CudaContext>, path: impl AsRef<Path>) -> Result<Self> {
+    pub fn load(gpu_id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let device = CudaContext::new(gpu_id)?;
+        let blas = Arc::new(CudaBlas::new(device.default_stream())?);
+
         let config_file = path.as_ref().join("config.json");
         let config: ModelConfig = serde_json::from_reader(std::fs::File::open(config_file)?)?;
         println!("Model Config: {:#?}", config);
@@ -227,11 +232,13 @@ impl Qwen2Model {
             config.rope_theta,
         )?;
         // Initialize KV Cache (using 80% of remaining free VRAM)
-        let kv_cache = KVCache::new(device, &stream, &config, 0.8)?;
-        let cuda_functions = CudaFunctions::load(device, head_dim)?;
+        let kv_cache = KVCache::new(&device, &stream, &config, 0.8)?;
+        let cuda_functions = CudaFunctions::load(&device, head_dim)?;
         let buffers = InferenceBuffers::new(&stream, &config)?;
 
         Ok(Qwen2Model {
+            device,
+            blas,
             embed_tokens,
             lm_head,
             layers,
@@ -242,6 +249,57 @@ impl Qwen2Model {
             cuda_functions,
             config,
         })
+    }
+    pub fn generate(
+        &mut self,
+        prompt_ids: &[u32],
+        sampler: &mut crate::sampler::Sampler,
+        max_new_tokens: usize,
+        token_callback: impl FnMut(u32) -> bool,
+    ) -> Result<()> {
+        let mut cache_pos = 0;
+        let mut next_token_id = 0;
+        let mut callback = token_callback;
+
+        let eos_token_id = self.config.eos_token_id;
+        let bos_token_id = self.config.bos_token_id;
+
+        // Prefill
+        if !prompt_ids.is_empty() {
+            self.forward(prompt_ids, cache_pos)?;
+            cache_pos += prompt_ids.len();
+
+            let mut logits = self.sample()?;
+            next_token_id = sampler.sample(&mut logits)?;
+
+            // Check stop conditions for first token
+            if next_token_id == eos_token_id || next_token_id == bos_token_id {
+                return Ok(());
+            }
+
+            if !callback(next_token_id) {
+                return Ok(());
+            }
+        }
+
+        // Decode Loop
+        for _ in 0..max_new_tokens {
+            self.forward(&[next_token_id], cache_pos)?;
+            cache_pos += 1;
+
+            let mut logits = self.sample()?;
+            next_token_id = sampler.sample(&mut logits)?;
+
+            if next_token_id == eos_token_id || next_token_id == bos_token_id {
+                break;
+            }
+
+            if !callback(next_token_id) {
+                break;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -658,12 +716,8 @@ impl Qwen2Model {
 }
 
 impl Qwen2Model {
-    pub fn sample(
-        &self,
-        _device: &CudaContext,
-        stream: &Arc<CudaStream>,
-        blas: &CudaBlas,
-    ) -> Result<Vec<f32>> {
+    pub fn sample(&self) -> Result<Vec<f32>> {
+        let stream = self.device.default_stream();
         let vocab_size = self.config.vocab_size;
         let hidden_dim = self.config.hidden_size;
         let logits = stream.alloc_zeros::<bf16>(vocab_size)?;
@@ -680,21 +734,21 @@ impl Qwen2Model {
 
         unsafe {
             cublasGemmEx(
-                *blas.handle(),
+                *self.blas.handle(),
                 cublasOperation_t::CUBLAS_OP_T,
                 cublasOperation_t::CUBLAS_OP_N,
                 vocab_size as i32, // m
                 1,                 // n
                 hidden_dim as i32, // k
                 &alpha as *const f32 as *const _,
-                self.lm_head.device_ptr(stream).0 as *const _,
+                self.lm_head.device_ptr(&stream).0 as *const _,
                 cudaDataType::CUDA_R_16BF,
                 hidden_dim as i32, // lda
-                self.buffers.hidden_states.device_ptr(stream).0 as *const _,
+                self.buffers.hidden_states.device_ptr(&stream).0 as *const _,
                 cudaDataType::CUDA_R_16BF,
                 hidden_dim as i32, // ldb
                 &beta as *const f32 as *const _,
-                logits.device_ptr(stream).0 as *mut _,
+                logits.device_ptr(&stream).0 as *mut _,
                 cudaDataType::CUDA_R_16BF,
                 vocab_size as i32, // ldc
                 cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -708,13 +762,10 @@ impl Qwen2Model {
         Ok(host_data.iter().map(|x: &bf16| x.to_f32()).collect())
     }
 
-    pub fn forward(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        blas: &CudaBlas,
-        input_ids: &[u32],
-        cache_pos: usize,
-    ) -> Result<()> {
+    pub fn forward(&mut self, input_ids: &[u32], cache_pos: usize) -> Result<()> {
+        let stream = self.device.default_stream();
+        let blas = &*self.blas;
+
         let seq_len = input_ids.len();
         if seq_len == 0 {
             return Ok(());
@@ -747,7 +798,7 @@ impl Qwen2Model {
                 // --- Attention Block ---
                 Self::apply_rmsnorm(
                     funcs,
-                    stream,
+                    &stream,
                     &mut buffers.norm_buffer,
                     Some(&buffers.hidden_states),
                     &layer.input_layernorm,
@@ -756,7 +807,7 @@ impl Qwen2Model {
 
                 unsafe {
                     Self::matmul_bf16(
-                        stream,
+                        &stream,
                         blas,
                         1,
                         hidden_dim,
@@ -768,7 +819,7 @@ impl Qwen2Model {
                         0.0,
                     )?;
                     Self::matmul_bf16(
-                        stream,
+                        &stream,
                         blas,
                         1,
                         num_kv_heads * head_dim,
@@ -780,7 +831,7 @@ impl Qwen2Model {
                         0.0,
                     )?;
                     Self::matmul_bf16(
-                        stream,
+                        &stream,
                         blas,
                         1,
                         num_kv_heads * head_dim,
@@ -796,7 +847,7 @@ impl Qwen2Model {
                 Self::apply_rope(
                     funcs,
                     rope,
-                    stream,
+                    &stream,
                     &mut buffers.q_states,
                     0,
                     &layer.q_bias,
@@ -809,7 +860,7 @@ impl Qwen2Model {
                     num_kv_heads,
                 )?;
                 self.kv_cache.update(
-                    stream,
+                    &stream,
                     i,
                     cache_pos,
                     &buffers.k_states,
@@ -820,7 +871,7 @@ impl Qwen2Model {
                 )?;
                 Self::apply_flash_decoding(
                     funcs,
-                    stream,
+                    &stream,
                     &mut buffers.att_output,
                     0,
                     &buffers.q_states,
@@ -835,7 +886,7 @@ impl Qwen2Model {
 
                 unsafe {
                     Self::matmul_bf16(
-                        stream,
+                        &stream,
                         blas,
                         1,
                         hidden_dim,
@@ -851,7 +902,7 @@ impl Qwen2Model {
                 // --- MLP Block ---
                 Self::apply_rmsnorm(
                     funcs,
-                    stream,
+                    &stream,
                     &mut buffers.norm_buffer,
                     Some(&buffers.hidden_states),
                     &layer.post_attention_layernorm,
@@ -860,7 +911,7 @@ impl Qwen2Model {
 
                 unsafe {
                     Self::matmul_bf16(
-                        stream,
+                        &stream,
                         blas,
                         1,
                         intermediate_size,
@@ -872,7 +923,7 @@ impl Qwen2Model {
                         0.0,
                     )?;
                     Self::matmul_bf16(
-                        stream,
+                        &stream,
                         blas,
                         1,
                         intermediate_size,
@@ -887,7 +938,7 @@ impl Qwen2Model {
 
                 Self::apply_activation(
                     funcs,
-                    stream,
+                    &stream,
                     &mut buffers.mlp_gate,
                     None,
                     &buffers.mlp_up,
@@ -895,7 +946,7 @@ impl Qwen2Model {
 
                 unsafe {
                     Self::matmul_bf16(
-                        stream,
+                        &stream,
                         blas,
                         1,
                         hidden_dim,
@@ -911,7 +962,7 @@ impl Qwen2Model {
 
             Self::apply_rmsnorm(
                 funcs,
-                stream,
+                &stream,
                 &mut buffers.hidden_states,
                 None,
                 &self.final_norm,
@@ -948,7 +999,7 @@ impl Qwen2Model {
             // 1. RMSNorm
             Self::apply_rmsnorm(
                 funcs,
-                stream,
+                &stream,
                 &mut norm_buffer,
                 Some(&hidden_states),
                 &layer.input_layernorm,
@@ -958,7 +1009,7 @@ impl Qwen2Model {
             // 2. Batched QKV Proj
             unsafe {
                 Self::matmul_bf16(
-                    stream,
+                    &stream,
                     blas,
                     seq_len,
                     hidden_dim,
@@ -970,7 +1021,7 @@ impl Qwen2Model {
                     0.0,
                 )?;
                 Self::matmul_bf16(
-                    stream,
+                    &stream,
                     blas,
                     seq_len,
                     num_kv_heads * head_dim,
@@ -982,7 +1033,7 @@ impl Qwen2Model {
                     0.0,
                 )?;
                 Self::matmul_bf16(
-                    stream,
+                    &stream,
                     blas,
                     seq_len,
                     num_kv_heads * head_dim,
@@ -1006,7 +1057,7 @@ impl Qwen2Model {
                 Self::apply_rope(
                     funcs,
                     rope,
-                    stream,
+                    &stream,
                     &mut q_states,
                     q_offset,
                     &layer.q_bias,
@@ -1019,7 +1070,7 @@ impl Qwen2Model {
                     num_kv_heads,
                 )?;
                 self.kv_cache.update(
-                    stream,
+                    &stream,
                     i,
                     current_pos,
                     &k_states,
@@ -1031,7 +1082,7 @@ impl Qwen2Model {
 
                 Self::apply_flash_decoding(
                     funcs,
-                    stream,
+                    &stream,
                     &mut att_output,
                     q_offset,
                     &q_states,
@@ -1048,7 +1099,7 @@ impl Qwen2Model {
             // 4. Batched Output Proj
             unsafe {
                 Self::matmul_bf16(
-                    stream,
+                    &stream,
                     blas,
                     seq_len,
                     hidden_dim,
@@ -1064,7 +1115,7 @@ impl Qwen2Model {
             // --- Batched MLP ---
             Self::apply_rmsnorm(
                 funcs,
-                stream,
+                &stream,
                 &mut norm_buffer,
                 Some(&hidden_states),
                 &layer.post_attention_layernorm,
@@ -1073,7 +1124,7 @@ impl Qwen2Model {
 
             unsafe {
                 Self::matmul_bf16(
-                    stream,
+                    &stream,
                     blas,
                     seq_len,
                     intermediate_size,
@@ -1085,7 +1136,7 @@ impl Qwen2Model {
                     0.0,
                 )?;
                 Self::matmul_bf16(
-                    stream,
+                    &stream,
                     blas,
                     seq_len,
                     intermediate_size,
@@ -1098,11 +1149,11 @@ impl Qwen2Model {
                 )?;
             }
 
-            Self::apply_activation(funcs, stream, &mut mlp_gate, None, &mlp_up)?;
+            Self::apply_activation(funcs, &stream, &mut mlp_gate, None, &mlp_up)?;
 
             unsafe {
                 Self::matmul_bf16(
-                    stream,
+                    &stream,
                     blas,
                     seq_len,
                     hidden_dim,
@@ -1119,7 +1170,7 @@ impl Qwen2Model {
         // Final Norm
         Self::apply_rmsnorm(
             funcs,
-            stream,
+            &stream,
             &mut hidden_states,
             None,
             &self.final_norm,

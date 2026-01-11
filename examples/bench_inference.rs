@@ -1,15 +1,10 @@
 use anyhow::Result;
-use cudarc::cublas::CudaBlas;
-use cudarc::driver::CudaContext;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
 use lucciola::models::Qwen2Model;
 
 fn main() -> Result<()> {
-    let device = CudaContext::new(0)?;
-    let blas = CudaBlas::new(device.default_stream())?;
-
     let model_path = "/app/lucciola/models/Qwen2.5-0.5B-Instruct";
 
     // 1. Load Tokenizer
@@ -18,7 +13,7 @@ fn main() -> Result<()> {
 
     // 2. Load Model
     println!("Loading model...");
-    let mut model = Qwen2Model::load(&device, model_path)?;
+    let mut model = Qwen2Model::load(0, model_path)?;
     println!("Model loaded.");
 
     // 3. Prepare Input
@@ -30,7 +25,7 @@ fn main() -> Result<()> {
     let n_input = input_ids.len();
     println!("Prompt length: {} tokens", n_input);
 
-    let stream = device.default_stream();
+    let stream = model.device.default_stream();
     let mut cache_pos = 0;
 
     // --- Benchmarking Prefill (TTFT) ---
@@ -38,17 +33,11 @@ fn main() -> Result<()> {
     stream.synchronize()?;
     let start_prefill = Instant::now();
 
-    // Process all but last
-    for &id in input_ids.iter().take(n_input - 1) {
-        model.forward(&stream, &blas, &[id], cache_pos)?;
-        cache_pos += 1;
-    }
+    // Batched Prefill
+    model.forward(input_ids, cache_pos)?;
+    cache_pos += n_input;
 
-    // Process last input token to get first output
-    let last_input = *input_ids.last().unwrap();
-    model.forward(&stream, &blas, &[last_input], cache_pos)?;
-    cache_pos += 1;
-    let _logits = model.sample(&device, &stream, &blas)?;
+    let _logits = model.sample()?;
 
     stream.synchronize()?;
     let prefill_duration = start_prefill.elapsed();
@@ -61,16 +50,25 @@ fn main() -> Result<()> {
     println!("Benchmarking Generation (50 tokens)...");
     let n_gen = 50;
 
-    let mut next_token_id = last_input;
+    // Get last token from input to start generation (though we verify sample next)
+    // Actually we pick the token from the sample() result usually, but here for simple bench
+    // we can just pick the argmax from the previous sample.
+    let logits = model.sample()?;
+    let mut next_token_id = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0 as u32;
 
     stream.synchronize()?;
     let start_gen = Instant::now();
 
     for _ in 0..n_gen {
-        model.forward(&stream, &blas, &[next_token_id], cache_pos)?;
+        model.forward(&[next_token_id], cache_pos)?;
         cache_pos += 1;
 
-        let logits = model.sample(&device, &stream, &blas)?;
+        let logits = model.sample()?;
 
         let (id, _) = logits
             .iter()
