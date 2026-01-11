@@ -1,6 +1,5 @@
 use anyhow::Result;
 use cudarc::cublas::CudaBlas;
-use cudarc::driver::CudaContext;
 use tokenizers::Tokenizer;
 
 use lucciola::models::Qwen2Model;

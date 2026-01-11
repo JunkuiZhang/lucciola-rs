@@ -530,7 +530,13 @@ impl Qwen2Model {
             shared_mem_bytes: (head_dim as u32) * 4,
         };
 
-        let mut builder = stream.launch_builder(&cuda_functions.attention);
+        let kernel = match head_dim {
+            64 => &cuda_functions.attention_64,
+            128 => &cuda_functions.attention_128,
+            _ => anyhow::bail!("Unsupported head_dim: {}", head_dim),
+        };
+
+        let mut builder = stream.launch_builder(kernel);
 
         let layer_idx = layer_idx as i32;
         let num_q_heads_i32 = num_q_heads as i32;

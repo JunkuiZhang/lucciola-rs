@@ -10,7 +10,8 @@ use crate::ptx;
 
 pub(crate) struct CudaFunctions {
     pub(crate) activation: CudaFunction,
-    pub(crate) attention: CudaFunction,
+    pub(crate) attention_64: CudaFunction,
+    pub(crate) attention_128: CudaFunction,
     pub(crate) rmsnorm: CudaFunction,
     pub(crate) rope: CudaFunction,
     pub(crate) softmax: CudaFunction,
@@ -20,8 +21,11 @@ impl CudaFunctions {
     pub(crate) fn load(context: &Arc<CudaContext>) -> Result<Self> {
         println!("Loading activation kernel...");
         let activation = load_cuda_funtion(context, ptx::ACTIVATION_PTX, "silu_and_mul_kernel")?;
-        println!("Loading attention kernel...");
-        let attention = load_cuda_funtion(context, ptx::ATTENTION_PTX, "flash_decoding_kernel")?;
+        println!("Loading attention kernels...");
+        let attention_64 =
+            load_cuda_funtion(context, ptx::ATTENTION_PTX, "flash_decoding_kernel_64")?;
+        let attention_128 =
+            load_cuda_funtion(context, ptx::ATTENTION_PTX, "flash_decoding_kernel_128")?;
         println!("Loading rmsnorm kernel...");
         let rmsnorm = load_cuda_funtion(context, ptx::RMSNORM_PTX, "rmsnorm_nvidia")?;
         println!("Loading rope kernel...");
@@ -31,7 +35,8 @@ impl CudaFunctions {
 
         Ok(Self {
             activation,
-            attention,
+            attention_64,
+            attention_128,
             rmsnorm,
             rope,
             softmax,
