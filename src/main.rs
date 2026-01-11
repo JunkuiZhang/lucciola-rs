@@ -3,11 +3,7 @@ use cudarc::cublas::CudaBlas;
 use cudarc::driver::CudaContext;
 use tokenizers::Tokenizer;
 
-use crate::models::Qwen2Model;
-
-mod kernels;
-mod models;
-mod ptx;
+use lucciola::models::Qwen2Model;
 
 fn main() -> Result<()> {
     let device = cudarc::driver::CudaContext::new(0)?;
