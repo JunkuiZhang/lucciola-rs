@@ -27,7 +27,7 @@ extern "C" __global__ void rmsnorm_nvidia(__nv_bfloat16 *out,
     }
 
     // 2. Block 级并行归约得到最终平方和
-    typedef cub::BlockReduce<float, 256> BlockReduceT;
+    typedef cub::BlockReduce<float, 1024> BlockReduceT;
     __shared__ typename BlockReduceT::TempStorage temp_storage;
 
     sq_sum = BlockReduceT(temp_storage).Sum(sq_sum);

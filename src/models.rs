@@ -34,8 +34,11 @@ fn default_rope_theta() -> f32 {
 pub struct LayerWeights {
     pub input_layernorm: CudaSlice<bf16>,
     pub q_proj: CudaSlice<bf16>,
+    pub q_bias: CudaSlice<bf16>,
     pub k_proj: CudaSlice<bf16>,
+    pub k_bias: CudaSlice<bf16>,
     pub v_proj: CudaSlice<bf16>,
+    pub v_bias: CudaSlice<bf16>,
     pub o_proj: CudaSlice<bf16>,
     pub post_attention_layernorm: CudaSlice<bf16>,
     pub gate_proj: CudaSlice<bf16>,
@@ -99,15 +102,30 @@ impl Qwen2Model {
                     &tensors,
                     &format!("{}self_attn.q_proj.weight", layer_prefix),
                 )?,
+                q_bias: get_tensor(
+                    &stream,
+                    &tensors,
+                    &format!("{}self_attn.q_proj.bias", layer_prefix),
+                )?,
                 k_proj: get_tensor(
                     &stream,
                     &tensors,
                     &format!("{}self_attn.k_proj.weight", layer_prefix),
                 )?,
+                k_bias: get_tensor(
+                    &stream,
+                    &tensors,
+                    &format!("{}self_attn.k_proj.bias", layer_prefix),
+                )?,
                 v_proj: get_tensor(
                     &stream,
                     &tensors,
                     &format!("{}self_attn.v_proj.weight", layer_prefix),
+                )?,
+                v_bias: get_tensor(
+                    &stream,
+                    &tensors,
+                    &format!("{}self_attn.v_proj.bias", layer_prefix),
                 )?,
                 o_proj: get_tensor(
                     &stream,
@@ -238,7 +256,11 @@ impl KVCache {
         k_input: &CudaSlice<bf16>,
         v_input: &CudaSlice<bf16>,
     ) -> Result<()> {
-        let cfg = LaunchConfig::for_num_elems(self.num_kv_heads as u32);
+        let cfg = LaunchConfig {
+            grid_dim: (self.num_kv_heads as u32, 1, 1),
+            block_dim: (self.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut builder = stream.launch_builder(&self.cuda_function);
         let layer_idx = layer_idx as i32;
         let pos = pos as i32;
@@ -542,6 +564,7 @@ impl Qwen2Model {
 
             // 2. QKV Proj
             unsafe {
+                stream.memcpy_dtod(&layer.q_bias, &mut q_states)?;
                 self.matmul_bf16(
                     stream,
                     blas,
@@ -552,8 +575,9 @@ impl Qwen2Model {
                     &layer.q_proj,
                     &mut q_states,
                     1.0,
-                    0.0,
+                    1.0,
                 )?;
+                stream.memcpy_dtod(&layer.k_bias, &mut k_states)?;
                 self.matmul_bf16(
                     stream,
                     blas,
@@ -564,8 +588,9 @@ impl Qwen2Model {
                     &layer.k_proj,
                     &mut k_states,
                     1.0,
-                    0.0,
+                    1.0,
                 )?;
+                stream.memcpy_dtod(&layer.v_bias, &mut v_states)?;
                 self.matmul_bf16(
                     stream,
                     blas,
@@ -576,7 +601,7 @@ impl Qwen2Model {
                     &layer.v_proj,
                     &mut v_states,
                     1.0,
-                    0.0,
+                    1.0,
                 )?;
             }
 
@@ -751,6 +776,10 @@ impl Qwen2Model {
 
         // Final Norm
         self.apply_rmsnorm(stream, &mut hidden_states, None, &self.final_norm, 1e-6)?;
+
+        // Synchronize to ensure all temporary buffers (q_states, k_states, etc.)
+        // are used before they are dropped and freed.
+        stream.synchronize()?;
 
         Ok(hidden_states)
     }

@@ -23,8 +23,7 @@ softmax_kernel(__nv_bfloat16 *logits, // 输入输出: [num_heads, seq_len]
 
     // 注意：所有线程必须参与 BlockReduce，即使它们在上面的循环中没做工作
     // CUB 会处理 synchronization
-    float row_max =
-        BlockReduce(temp_storage).Reduce(local_max, cuda::maximum<float>());
+    float row_max = BlockReduce(temp_storage).Reduce(local_max, cub::Max());
 
     // 广播 Max 到所有线程
     __shared__ float shared_max;
