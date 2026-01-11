@@ -4,8 +4,7 @@ use cudarc::cublas::sys::{
     cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
 };
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use half::bf16;
 use memmap2::MmapOptions;
@@ -309,8 +308,10 @@ impl KVCache {
         stream: &Arc<CudaStream>,
         layer_idx: usize,
         pos: usize,
-        k_input: &impl DevicePtr<bf16>,
-        v_input: &impl DevicePtr<bf16>,
+        k_input: &CudaSlice<bf16>,
+        k_offset: usize,
+        v_input: &CudaSlice<bf16>,
+        v_offset: usize,
         v_bias: &CudaSlice<bf16>,
     ) -> Result<()> {
         let cfg = LaunchConfig {
@@ -319,8 +320,8 @@ impl KVCache {
             shared_mem_bytes: 0,
         };
 
-        let (k_ptr, _k_guard) = DevicePtr::device_ptr(k_input, stream);
-        let (v_ptr, _v_guard) = DevicePtr::device_ptr(v_input, stream);
+        let k_view = k_input.slice(k_offset..k_offset + (self.num_kv_heads * self.head_dim));
+        let v_view = v_input.slice(v_offset..v_offset + (self.num_kv_heads * self.head_dim));
 
         let mut builder = stream.launch_builder(&self.cuda_function);
         let layer_idx = layer_idx as i32;
@@ -332,8 +333,8 @@ impl KVCache {
         builder
             .arg(&self.k)
             .arg(&self.v)
-            .arg(&k_ptr)
-            .arg(&v_ptr)
+            .arg(&k_view)
+            .arg(&v_view)
             .arg(v_bias)
             .arg(&layer_idx)
             .arg(&pos)
@@ -460,9 +461,11 @@ impl Qwen2Model {
         cuda_functions: &CudaFunctions,
         rope: &RopeCache,
         stream: &Arc<CudaStream>,
-        q: &mut (impl DevicePtrMut<bf16> + DevicePtr<bf16>),
+        q: &mut CudaSlice<bf16>,
+        q_offset: usize,
         q_bias: &CudaSlice<bf16>,
-        k: &mut (impl DevicePtrMut<bf16> + DevicePtr<bf16>),
+        k: &mut CudaSlice<bf16>,
+        k_offset: usize,
         k_bias: &CudaSlice<bf16>,
         pos: usize,
         head_dim: usize,
@@ -473,25 +476,26 @@ impl Qwen2Model {
         let cfg = LaunchConfig::for_num_elems(total_threads as u32);
 
         let pos = pos as i32;
-        let head_dim = head_dim as i32;
-        let num_q_heads = num_q_heads as i32;
-        let num_k_heads = num_k_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let num_q_heads_i32 = num_q_heads as i32;
+        let num_k_heads_i32 = num_k_heads as i32;
 
-        let (q_ptr, _q_guard) = DevicePtr::device_ptr(q, stream);
-        let (k_ptr, _k_guard) = DevicePtr::device_ptr(k, stream);
+        // Use slice_mut. CudaViewMut implements DevicePtrMut AND DevicePtr.
+        let mut q_view = q.slice_mut(q_offset..q_offset + (num_q_heads * head_dim));
+        let mut k_view = k.slice_mut(k_offset..k_offset + (num_k_heads * head_dim));
 
         let mut builder = stream.launch_builder(&cuda_functions.rope);
         builder
-            .arg(&q_ptr)
+            .arg(&mut q_view)
             .arg(q_bias)
-            .arg(&k_ptr)
+            .arg(&mut k_view)
             .arg(k_bias)
             .arg(&rope.cos)
             .arg(&rope.sin)
             .arg(&pos)
-            .arg(&head_dim)
-            .arg(&num_q_heads)
-            .arg(&num_k_heads);
+            .arg(&head_dim_i32)
+            .arg(&num_q_heads_i32)
+            .arg(&num_k_heads_i32);
         unsafe {
             builder.launch(cfg)?;
         }
@@ -501,8 +505,10 @@ impl Qwen2Model {
     fn apply_flash_decoding(
         cuda_functions: &CudaFunctions,
         stream: &Arc<CudaStream>,
-        output: &mut (impl DevicePtrMut<bf16> + DevicePtr<bf16>),
-        q: &impl DevicePtr<bf16>,
+        output: &mut CudaSlice<bf16>,
+        out_offset: usize,
+        q: &CudaSlice<bf16>,
+        q_offset: usize,
         cache: &KVCache,
         layer_idx: usize,
         pos: usize,
@@ -518,6 +524,10 @@ impl Qwen2Model {
             shared_mem_bytes: (head_dim as u32) * 4,
         };
 
+        // Create Views inside
+        let mut out_view = output.slice_mut(out_offset..out_offset + (num_q_heads * head_dim));
+        let q_view = q.slice(q_offset..q_offset + (num_q_heads * head_dim));
+
         let mut builder = stream.launch_builder(&cuda_functions.attention);
 
         let layer_idx = layer_idx as i32;
@@ -526,12 +536,9 @@ impl Qwen2Model {
         let head_dim_i32 = head_dim as i32;
         let current_pos = pos as i32;
 
-        let (out_ptr, _out_guard) = DevicePtr::device_ptr(output, stream);
-        let (q_ptr, _q_guard) = DevicePtr::device_ptr(q, stream);
-
         builder
-            .arg(&out_ptr)
-            .arg(&q_ptr)
+            .arg(&mut out_view)
+            .arg(&q_view)
             .arg(&cache.k)
             .arg(&cache.v)
             .arg(&layer_idx)
@@ -690,8 +697,10 @@ impl Qwen2Model {
                     rope,
                     stream,
                     &mut buffers.q_states,
+                    0,
                     &layer.q_bias,
                     &mut buffers.k_states,
+                    0,
                     &layer.k_bias,
                     cache_pos,
                     head_dim,
@@ -703,14 +712,18 @@ impl Qwen2Model {
                     i,
                     cache_pos,
                     &buffers.k_states,
+                    0,
                     &buffers.v_states,
+                    0,
                     &layer.v_bias,
                 )?;
                 Self::apply_flash_decoding(
                     funcs,
                     stream,
                     &mut buffers.att_output,
+                    0,
                     &buffers.q_states,
+                    0,
                     &self.kv_cache,
                     i,
                     cache_pos,
@@ -888,33 +901,40 @@ impl Qwen2Model {
                 let k_offset = t * num_kv_heads * head_dim;
                 let v_offset = t * num_kv_heads * head_dim;
 
-                let mut q_sub = q_states.slice_mut(q_offset..q_offset + hidden_dim);
-                let mut k_sub = k_states.slice_mut(k_offset..k_offset + num_kv_heads * head_dim);
-                let v_sub = v_states.slice(v_offset..v_offset + num_kv_heads * head_dim);
-
                 // RoPE & KV Update & Attention
                 Self::apply_rope(
                     funcs,
                     rope,
                     stream,
-                    &mut q_sub,
+                    &mut q_states,
+                    q_offset,
                     &layer.q_bias,
-                    &mut k_sub,
+                    &mut k_states,
+                    k_offset,
                     &layer.k_bias,
                     current_pos,
                     head_dim,
                     num_q_heads,
                     num_kv_heads,
                 )?;
-                self.kv_cache
-                    .update(stream, i, current_pos, &k_sub, &v_sub, &layer.v_bias)?;
+                self.kv_cache.update(
+                    stream,
+                    i,
+                    current_pos,
+                    &k_states,
+                    k_offset,
+                    &v_states,
+                    v_offset,
+                    &layer.v_bias,
+                )?;
 
-                let mut att_sub = att_output.slice_mut(q_offset..q_offset + hidden_dim);
                 Self::apply_flash_decoding(
                     funcs,
                     stream,
-                    &mut att_sub,
-                    &q_sub,
+                    &mut att_output,
+                    q_offset,
+                    &q_states,
+                    q_offset,
                     &self.kv_cache,
                     i,
                     current_pos,
