@@ -26,6 +26,10 @@ pub struct ModelConfig {
     pub intermediate_size: usize,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    #[serde(default)]
+    pub model_type: String,
+    pub eos_token_id: u32,
+    pub bos_token_id: u32,
 }
 
 fn default_rope_theta() -> f32 {
@@ -56,7 +60,7 @@ pub struct Qwen2Model {
     pub kv_cache: KVCache,
     pub buffers: InferenceBuffers,
     cuda_functions: CudaFunctions,
-    config: ModelConfig,
+    pub config: ModelConfig,
 }
 
 pub struct InferenceBuffers {
