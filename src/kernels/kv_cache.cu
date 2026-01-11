@@ -5,8 +5,8 @@ extern "C" __global__ void update_kv_cache_kernel(
     __nv_bfloat16 *v_cache, // 同上
     const __nv_bfloat16 *new_k, // 当前层新算的 k [num_kv_heads, head_dim]
     const __nv_bfloat16 *new_v, // 当前层新算的 v [num_kv_heads, head_dim]
-    int layer_id, int pos_id, int num_layers, int num_kv_heads, int max_seq_len,
-    int head_dim) {
+    const __nv_bfloat16 *v_bias, int layer_id, int pos_id, int num_layers,
+    int num_kv_heads, int max_seq_len, int head_dim) {
     int head_idx = blockIdx.x; // 对应哪个 KV 头
     int dim_idx = threadIdx.x; // 对应维度
 
@@ -23,6 +23,9 @@ extern "C" __global__ void update_kv_cache_kernel(
         int new_idx = head_idx * head_dim + dim_idx;
 
         k_cache[cache_idx] = new_k[new_idx];
-        v_cache[cache_idx] = new_v[new_idx];
+
+        float val_v = __bfloat162float(new_v[new_idx]);
+        float bias = __bfloat162float(v_bias[new_idx]);
+        v_cache[cache_idx] = __float2bfloat16(val_v + bias);
     }
 }

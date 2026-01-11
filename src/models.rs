@@ -255,6 +255,7 @@ impl KVCache {
         pos: usize,
         k_input: &CudaSlice<bf16>,
         v_input: &CudaSlice<bf16>,
+        v_bias: &CudaSlice<bf16>,
     ) -> Result<()> {
         let cfg = LaunchConfig {
             grid_dim: (self.num_kv_heads as u32, 1, 1),
@@ -273,6 +274,7 @@ impl KVCache {
             .arg(&self.v)
             .arg(k_input)
             .arg(v_input)
+            .arg(v_bias)
             .arg(&layer_idx)
             .arg(&pos)
             .arg(&num_layers)
@@ -399,7 +401,9 @@ impl Qwen2Model {
         &self,
         stream: &Arc<CudaStream>,
         q: &mut CudaSlice<bf16>,
+        q_bias: &CudaSlice<bf16>,
         k: &mut CudaSlice<bf16>,
+        k_bias: &CudaSlice<bf16>,
         pos: usize,
         head_dim: usize,
         num_q_heads: usize,
@@ -416,7 +420,9 @@ impl Qwen2Model {
         let mut builder = stream.launch_builder(&self.cuda_functions.rope);
         builder
             .arg(q)
+            .arg(q_bias)
             .arg(k)
+            .arg(k_bias)
             .arg(&self.rope.cos)
             .arg(&self.rope.sin)
             .arg(&pos)
@@ -564,7 +570,6 @@ impl Qwen2Model {
 
             // 2. QKV Proj
             unsafe {
-                stream.memcpy_dtod(&layer.q_bias, &mut q_states)?;
                 self.matmul_bf16(
                     stream,
                     blas,
@@ -575,9 +580,8 @@ impl Qwen2Model {
                     &layer.q_proj,
                     &mut q_states,
                     1.0,
-                    1.0,
+                    0.0,
                 )?;
-                stream.memcpy_dtod(&layer.k_bias, &mut k_states)?;
                 self.matmul_bf16(
                     stream,
                     blas,
@@ -588,9 +592,8 @@ impl Qwen2Model {
                     &layer.k_proj,
                     &mut k_states,
                     1.0,
-                    1.0,
+                    0.0,
                 )?;
-                stream.memcpy_dtod(&layer.v_bias, &mut v_states)?;
                 self.matmul_bf16(
                     stream,
                     blas,
@@ -601,24 +604,26 @@ impl Qwen2Model {
                     &layer.v_proj,
                     &mut v_states,
                     1.0,
-                    1.0,
+                    0.0,
                 )?;
             }
 
-            // 3. RoPE
+            // 3. RoPE (Fused Bias Add)
             self.apply_rope(
                 stream,
                 &mut q_states,
+                &layer.q_bias,
                 &mut k_states,
+                &layer.k_bias,
                 cache_pos,
                 head_dim,
                 num_q_heads,
                 num_kv_heads,
             )?;
 
-            // 4. Update KV Cache
+            // 4. Update KV Cache (Fused V Bias Add)
             self.kv_cache
-                .update(stream, i, cache_pos, &k_states, &v_states)?;
+                .update(stream, i, cache_pos, &k_states, &v_states, &layer.v_bias)?;
 
             // 5. Attention (Manual Batching over KV Heads)
             let layer_offset = i * kv_cache_layer_stride;

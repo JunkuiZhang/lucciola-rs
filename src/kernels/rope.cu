@@ -1,8 +1,10 @@
 #include <cuda_bf16.h>
 
 extern "C" __global__ void
-rope(__nv_bfloat16 *q,       // [num_heads, head_dim]
-     __nv_bfloat16 *k,       // [num_kv_heads, head_dim]
+rope(__nv_bfloat16 *q, // [num_heads, head_dim]
+     const __nv_bfloat16 *q_bias,
+     __nv_bfloat16 *k, // [num_kv_heads, head_dim]
+     const __nv_bfloat16 *k_bias,
      const float *cos_cache, // [max_seq_len, head_dim / 2]
      const float *sin_cache, // [max_seq_len, head_dim / 2]
      int pos_idx, int head_dim, int num_q_heads, int num_k_heads) {
@@ -23,8 +25,10 @@ rope(__nv_bfloat16 *q,       // [num_heads, head_dim]
     int idx1 = head_idx * head_dim + dim_idx;
     int idx2 = head_idx * head_dim + dim_idx + half_dim;
 
-    float v1 = __bfloat162float(q[idx1]);
-    float v2 = __bfloat162float(q[idx2]);
+    float q_b1 = __bfloat162float(q_bias[idx1]);
+    float q_b2 = __bfloat162float(q_bias[idx2]);
+    float v1 = __bfloat162float(q[idx1]) + q_b1;
+    float v2 = __bfloat162float(q[idx2]) + q_b2;
 
     // 旋转矩阵计算
     q[idx1] = __float2bfloat16(v1 * cos_val - v2 * sin_val);
@@ -35,8 +39,10 @@ rope(__nv_bfloat16 *q,       // [num_heads, head_dim]
         int k_idx1 = head_idx * head_dim + dim_idx;
         int k_idx2 = head_idx * head_dim + dim_idx + half_dim;
 
-        float kv1 = __bfloat162float(k[k_idx1]);
-        float kv2 = __bfloat162float(k[k_idx2]);
+        float k_b1 = __bfloat162float(k_bias[k_idx1]);
+        float k_b2 = __bfloat162float(k_bias[k_idx2]);
+        float kv1 = __bfloat162float(k[k_idx1]) + k_b1;
+        float kv2 = __bfloat162float(k[k_idx2]) + k_b2;
 
         k[k_idx1] = __float2bfloat16(kv1 * cos_val - kv2 * sin_val);
         k[k_idx2] = __float2bfloat16(kv1 * sin_val + kv2 * cos_val);
