@@ -508,6 +508,54 @@ impl Qwen2Model {
         }
         Ok(())
     }
+
+    fn apply_flash_decoding(
+        cuda_functions: &CudaFunctions,
+        stream: &Arc<CudaStream>,
+        output: &mut CudaSlice<bf16>,
+        q: &CudaSlice<bf16>,
+        k_cache: &KVCache,
+        v_cache: &KVCache,
+        layer_idx: usize,
+        pos: usize,
+        head_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+    ) -> Result<()> {
+        let max_seq_len = k_cache.max_seq_len as i32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let cfg = LaunchConfig {
+            grid_dim: (num_q_heads as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (head_dim as u32) * 4,
+        };
+
+        let mut builder = stream.launch_builder(&cuda_functions.attention);
+
+        let layer_idx = layer_idx as i32;
+        let num_q_heads_i32 = num_q_heads as i32;
+        let num_kv_heads_i32 = num_kv_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let current_pos = pos as i32;
+
+        builder
+            .arg(output)
+            .arg(q)
+            .arg(&k_cache.k)
+            .arg(&k_cache.v)
+            .arg(&layer_idx)
+            .arg(&num_q_heads_i32)
+            .arg(&num_kv_heads_i32)
+            .arg(&head_dim_i32)
+            .arg(&max_seq_len)
+            .arg(&current_pos)
+            .arg(&scale);
+
+        unsafe {
+            builder.launch(cfg)?;
+        }
+        Ok(())
+    }
 }
 
 impl Qwen2Model {
@@ -674,89 +722,20 @@ impl Qwen2Model {
                 &layer.v_bias,
             )?;
 
-            // 5. Attention (Manual Batching over KV Heads)
-            let layer_offset = i * kv_cache_layer_stride;
-            for kv_head in 0..num_kv_heads {
-                let q_start_head = kv_head * group_size;
-                let q_offset = q_start_head * head_dim;
-
-                let k_cache_ptr_offset = layer_offset + kv_head * kv_cache_head_stride;
-                // Pointer arithmetic for bf16 (2 bytes)
-                // Use device_ptr(stream).0
-                let k_cache_ptr =
-                    self.kv_cache.k.device_ptr(stream).0 + (k_cache_ptr_offset * 2) as u64;
-                let v_cache_ptr =
-                    self.kv_cache.v.device_ptr(stream).0 + (k_cache_ptr_offset * 2) as u64;
-
-                let q_sub = buffers
-                    .q_states
-                    .slice(q_offset..q_offset + group_size * head_dim);
-
-                let m = group_size;
-                let n = cache_pos + 1;
-                let k = head_dim;
-
-                let alpha = 1.0f32 / (head_dim as f32).sqrt();
-                let beta = 0.0f32;
-
-                // 5a. Q * K^T
-                unsafe {
-                    cublasGemmEx(
-                        *blas.handle(),
-                        cublasOperation_t::CUBLAS_OP_T,
-                        cublasOperation_t::CUBLAS_OP_N,
-                        n as i32,
-                        m as i32,
-                        k as i32,
-                        &alpha as *const f32 as *const _,
-                        k_cache_ptr as *const _,
-                        cudaDataType::CUDA_R_16BF,
-                        k as i32,
-                        q_sub.device_ptr(stream).0 as *const _,
-                        cudaDataType::CUDA_R_16BF,
-                        k as i32,
-                        &beta as *const f32 as *const _,
-                        buffers.scores_buf.device_ptr(stream).0 as *mut _,
-                        cudaDataType::CUDA_R_16BF,
-                        n as i32,
-                        cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    );
-                }
-
-                // 5b. Softmax
-                Self::apply_softmax(funcs, stream, &mut buffers.scores_buf, n, m)?;
-
-                // 5c. Score * V
-                let att_out_sub = buffers
-                    .att_output
-                    .slice(q_offset..q_offset + group_size * head_dim);
-                let alpha_v = 1.0f32;
-
-                unsafe {
-                    cublasGemmEx(
-                        *blas.handle(),
-                        cublasOperation_t::CUBLAS_OP_N,
-                        cublasOperation_t::CUBLAS_OP_N,
-                        k as i32,
-                        m as i32,
-                        n as i32,
-                        &alpha_v as *const f32 as *const _,
-                        v_cache_ptr as *const _,
-                        cudaDataType::CUDA_R_16BF,
-                        k as i32,
-                        buffers.scores_buf.device_ptr(stream).0 as *const _,
-                        cudaDataType::CUDA_R_16BF,
-                        n as i32,
-                        &beta as *const f32 as *const _,
-                        att_out_sub.device_ptr(stream).0 as *mut _,
-                        cudaDataType::CUDA_R_16BF,
-                        k as i32,
-                        cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    );
-                }
-            }
+            // 5. Attention (Fused Flash Decoding)
+            Self::apply_flash_decoding(
+                funcs,
+                stream,
+                &mut buffers.att_output,
+                &buffers.q_states,
+                &self.kv_cache,
+                &self.kv_cache,
+                i,
+                cache_pos,
+                head_dim,
+                num_q_heads,
+                num_kv_heads,
+            )?;
 
             // 6. Output Projection (accumulate to hidden_states for residual)
             unsafe {

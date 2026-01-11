@@ -21,7 +21,7 @@ impl CudaFunctions {
         println!("Loading activation kernel...");
         let activation = load_cuda_funtion(context, ptx::ACTIVATION_PTX, "silu_and_mul_kernel")?;
         println!("Loading attention kernel...");
-        let attention = load_cuda_funtion(context, ptx::ATTENTION_PTX, "gqa_attention_kernel")?;
+        let attention = load_cuda_funtion(context, ptx::ATTENTION_PTX, "flash_decoding_kernel")?;
         println!("Loading rmsnorm kernel...");
         let rmsnorm = load_cuda_funtion(context, ptx::RMSNORM_PTX, "rmsnorm_nvidia")?;
         println!("Loading rope kernel...");
