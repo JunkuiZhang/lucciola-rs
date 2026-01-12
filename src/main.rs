@@ -23,14 +23,15 @@ fn main() -> Result<()> {
     // 3. Configure Sampler (Temp=0.8, Top-P=0.9)
     let mut sampler = Sampler::new(42, 0.8, 0.9, 0);
 
+    let prompt = "请介绍一下量子计算的基本原理。";
     // 4. Chat Template
     let mut chat = ChatTemplate::new(Some(&model.config.model_type));
     chat.add("system", "You are a helpful assistant.");
-    chat.add("user", "请用一句话解释量子计算。");
+    chat.add("user", prompt);
 
     let input_ids = chat.apply(&tokenizer)?;
 
-    println!("Prompt: '{}'", "请用一句话解释量子计算。");
+    println!("Prompt: '{}'", prompt);
 
     // 5. Generation
     print!("Response: ");

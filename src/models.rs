@@ -4,7 +4,8 @@ use cudarc::cublas::sys::{
     cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
 };
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig,
+    PushKernelArg,
 };
 use half::bf16;
 use memmap2::MmapOptions;
@@ -30,6 +31,7 @@ pub struct ModelConfig {
     pub model_type: String,
     pub eos_token_id: u32,
     pub bos_token_id: u32,
+    pub tie_word_embeddings: bool,
 }
 
 fn default_rope_theta() -> f32 {
@@ -149,10 +151,11 @@ impl Qwen2Model {
         let stream = device.default_stream();
 
         let embed_tokens = get_tensor(&stream, &tensors, "model.embed_tokens.weight")?;
-        let lm_head = get_tensor(&stream, &tensors, "lm_head.weight").or_else(|_| {
-            println!("lm_head.weight not found, using embed_tokens (tied weights)");
-            Ok::<_, anyhow::Error>(embed_tokens.clone())
-        })?;
+        let lm_head = if config.tie_word_embeddings {
+            embed_tokens.clone()
+        } else {
+            get_tensor(&stream, &tensors, "lm_head.weight")?
+        };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
@@ -720,7 +723,7 @@ impl Qwen2Model {
         let stream = self.device.default_stream();
         let vocab_size = self.config.vocab_size;
         let hidden_dim = self.config.hidden_size;
-        let logits = stream.alloc_zeros::<bf16>(vocab_size)?;
+        let mut logits = stream.alloc_zeros::<bf16>(vocab_size)?;
 
         // C = A * B
         // C [V, 1] = lm_head [V, H] * hidden_states [H, 1]
@@ -748,7 +751,7 @@ impl Qwen2Model {
                 cudaDataType::CUDA_R_16BF,
                 hidden_dim as i32, // ldb
                 &beta as *const f32 as *const _,
-                logits.device_ptr(&stream).0 as *mut _,
+                logits.device_ptr_mut(&stream).0 as _,
                 cudaDataType::CUDA_R_16BF,
                 vocab_size as i32, // ldc
                 cublasComputeType_t::CUBLAS_COMPUTE_32F,
