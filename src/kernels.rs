@@ -23,7 +23,8 @@ pub struct CudaFunctions {
 impl CudaFunctions {
     pub(crate) fn load(context: &Arc<CudaContext>, head_dim: usize) -> Result<Self> {
         println!("Loading activation kernel...");
-        let activation = load_cuda_funtion(context, ptx::ACTIVATION_PTX, "silu_and_mul_fused_kernel")?;
+        let activation =
+            load_cuda_funtion(context, ptx::ACTIVATION_PTX, "silu_and_mul_fused_kernel")?;
         println!("Loading attention kernels...");
         let attention = match head_dim {
             64 => "flash_decoding_kernel_64",
@@ -131,7 +132,7 @@ impl CudaFunctions {
     ) -> Result<()> {
         let total_elements = seq_len * intermediate_size;
         let cfg = LaunchConfig::for_num_elems(total_elements as u32);
-        
+
         // Kernel args: buffer, rows (seq_len), cols (intermediate_size)
         // thread_id -> index in [0, total_elements)
         let n_elements_i32 = total_elements as i32;
