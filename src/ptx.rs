@@ -14,3 +14,6 @@ pub(crate) static RMSNORM_PTX: &'static str =
     include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.cu.ptx"));
 
 pub(crate) static ROPE_PTX: &'static str = include_str!(concat!(env!("OUT_DIR"), "/rope.cu.ptx"));
+
+pub(crate) static SAMPLING_PTX: &'static str =
+    include_str!(concat!(env!("OUT_DIR"), "/sampling.cu.ptx"));

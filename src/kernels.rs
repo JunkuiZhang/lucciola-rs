@@ -18,6 +18,7 @@ pub struct CudaFunctions {
     pub(crate) batched_embedding: CudaFunction,
     pub(crate) rmsnorm: CudaFunction,
     pub(crate) rope: CudaFunction,
+    pub(crate) sampling: CudaFunction,
 }
 
 impl CudaFunctions {
@@ -44,6 +45,8 @@ impl CudaFunctions {
         let rmsnorm = load_cuda_funtion(context, ptx::RMSNORM_PTX, "rmsnorm_nvidia")?;
         println!("Loading rope kernel...");
         let rope = load_cuda_funtion(context, ptx::ROPE_PTX, "rope")?;
+        println!("Loading sampling kernel...");
+        let sampling = load_cuda_funtion(context, ptx::SAMPLING_PTX, "argmax_kernel")?;
         println!("Loading formatted kernels done.");
 
         Ok(Self {
@@ -52,6 +55,7 @@ impl CudaFunctions {
             batched_embedding,
             rmsnorm,
             rope,
+            sampling,
         })
     }
 
@@ -255,6 +259,30 @@ impl CudaFunctions {
         unsafe {
             builder.launch(cfg)?;
         }
+        Ok(())
+    }
+
+    pub fn apply_argmax(
+        &self,
+        stream: &CudaStream,
+        input: &CudaSlice<bf16>,
+        output_idx: &mut CudaSlice<u32>,
+        vocab_size: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let vocab_size_i32 = vocab_size as i32;
+        unsafe {
+            stream
+                .launch_builder(&self.sampling)
+                .arg(input)
+                .arg(&vocab_size_i32)
+                .arg(output_idx)
+                .launch(cfg)?;
+        };
         Ok(())
     }
 }

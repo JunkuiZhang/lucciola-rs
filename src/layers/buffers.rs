@@ -12,10 +12,12 @@ pub struct InferenceBuffers {
     pub gate_up_states: CudaSlice<bf16>,
     pub norm_buffer: CudaSlice<bf16>,
     pub scores_buf: CudaSlice<bf16>,
+    pub logits: CudaSlice<bf16>,
 }
 
 impl InferenceBuffers {
     pub fn new(stream: &Arc<CudaStream>, config: &ModelConfig) -> Result<Self> {
+        let vocab_size = config.vocab_size;
         let hidden_dim = config.hidden_size;
         let head_dim = hidden_dim / config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
@@ -39,6 +41,8 @@ impl InferenceBuffers {
         let max_scores_len = group_size * config.max_position_embeddings;
         let scores_buf = stream.alloc_zeros::<bf16>(max_scores_len)?;
 
+        let logits = stream.alloc_zeros::<bf16>(vocab_size)?;
+
         Ok(Self {
             hidden_states,
             qkv_states,
@@ -46,6 +50,7 @@ impl InferenceBuffers {
             gate_up_states,
             norm_buffer,
             scores_buf,
+            logits,
         })
     }
 }

@@ -3,6 +3,7 @@ use std::time::Instant;
 use tokenizers::Tokenizer;
 
 use lucciola::models::Qwen2Model;
+use lucciola::sampler::Sampler;
 
 fn main() -> Result<()> {
     let model_path = "/app/lucciola/models/Qwen2.5-0.5B-Instruct";
@@ -15,6 +16,8 @@ fn main() -> Result<()> {
     println!("Loading model...");
     let mut model = Qwen2Model::load(0, model_path)?;
     println!("Model loaded.");
+
+    let mut sampler = Sampler::new(None, 0.0, 0.9, 50);
 
     // 3. Prepare Input
     let prompt = "To be, or not to be, that is the question: Whether 'tis nobler in the mind to suffer The slings and arrows of outrageous fortune, Or to take arms against a sea of troubles And by opposing end them.";
@@ -37,7 +40,7 @@ fn main() -> Result<()> {
     model.forward(input_ids, cache_pos)?;
     cache_pos += n_input;
 
-    let _logits = model.sample()?;
+    let _logits = model.compute_logits()?;
 
     stream.synchronize()?;
     let prefill_duration = start_prefill.elapsed();
@@ -53,13 +56,7 @@ fn main() -> Result<()> {
     // Get last token from input to start generation (though we verify sample next)
     // Actually we pick the token from the sample() result usually, but here for simple bench
     // we can just pick the argmax from the previous sample.
-    let logits = model.sample()?;
-    let mut next_token_id = logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap()
-        .0 as u32;
+    let mut next_token_id = model.sample_token(&mut sampler)?;
 
     stream.synchronize()?;
     let start_gen = Instant::now();
@@ -68,14 +65,7 @@ fn main() -> Result<()> {
         model.forward(&[next_token_id], cache_pos)?;
         cache_pos += 1;
 
-        let logits = model.sample()?;
-
-        let (id, _) = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap();
-        next_token_id = id as u32;
+        next_token_id = model.sample_token(&mut sampler)?;
     }
 
     stream.synchronize()?;

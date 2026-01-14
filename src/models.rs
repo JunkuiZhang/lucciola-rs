@@ -16,6 +16,7 @@ use crate::layers::buffers::InferenceBuffers;
 use crate::layers::kv_cache::KVCache;
 use crate::layers::rope::RopeCache;
 use crate::layers::weights::LayerWeights;
+use crate::sampler::Sampler;
 use crate::streamer::Streamer;
 use crate::utils::{concat_tensors, get_tensor};
 
@@ -39,6 +40,7 @@ pub struct Qwen2Model {
     pub buffers: InferenceBuffers,
     cuda_functions: CudaFunctions,
     pub config: ModelConfig,
+    pub sample_indices_buffer: CudaSlice<u32>,
 }
 
 impl Qwen2Model {
@@ -129,6 +131,7 @@ impl Qwen2Model {
         let kv_cache = KVCache::new(&device, &stream, &config, 0.8)?;
         let cuda_functions = CudaFunctions::load(&device, head_dim)?;
         let buffers = InferenceBuffers::new(&stream, &config)?;
+        let sample_indices_buffer = stream.alloc_zeros::<u32>(1)?;
 
         Ok(Qwen2Model {
             device,
@@ -142,6 +145,7 @@ impl Qwen2Model {
             buffers,
             cuda_functions,
             config,
+            sample_indices_buffer,
         })
     }
     pub fn generate(
@@ -164,8 +168,7 @@ impl Qwen2Model {
             self.forward(prompt_ids, cache_pos)?;
             cache_pos += prompt_ids.len();
 
-            let mut logits = self.sample()?;
-            next_token_id = sampler.sample(&mut logits)?;
+            next_token_id = self.sample_token(sampler)?;
 
             // Check stop conditions for first token
             if next_token_id == eos_token_id || next_token_id == bos_token_id {
@@ -184,8 +187,7 @@ impl Qwen2Model {
             self.forward(&[next_token_id], cache_pos)?;
             cache_pos += 1;
 
-            let mut logits = self.sample()?;
-            next_token_id = sampler.sample(&mut logits)?;
+            next_token_id = self.sample_token(sampler)?;
 
             if next_token_id == eos_token_id || next_token_id == bos_token_id {
                 break;
@@ -295,11 +297,10 @@ impl Qwen2Model {
         Ok(())
     }
 
-    pub fn sample(&self) -> Result<Vec<f32>> {
+    pub fn compute_logits(&mut self) -> Result<()> {
         let stream = self.device.default_stream();
         let vocab_size = self.config.vocab_size;
         let hidden_dim = self.config.hidden_size;
-        let mut logits = stream.alloc_zeros::<bf16>(vocab_size)?;
 
         // C = A * B
         // C [V, 1] = lm_head [V, H] * hidden_states [H, 1]
@@ -327,16 +328,43 @@ impl Qwen2Model {
                 cudaDataType::CUDA_R_16BF,
                 hidden_dim as i32, // ldb
                 &beta as *const f32 as *const _,
-                logits.device_ptr_mut(&stream).0 as _,
+                self.buffers.logits.device_ptr_mut(&stream).0 as _,
                 cudaDataType::CUDA_R_16BF,
                 vocab_size as i32, // ldc
                 cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             );
         }
+        Ok(())
+    }
 
-        let host_data = stream.clone_dtoh(&logits)?;
-        Ok(host_data.into_iter().map(|x: bf16| x.to_f32()).collect())
+    pub fn sample_token(&mut self, sampler: &mut Sampler) -> Result<u32> {
+        self.compute_logits()?;
+
+        // Access via public field since sampler is outside
+        // But sampler doesn't expose temperature publicly?
+        // Let's assume we can access it or use a method
+        // Sampler struct definition in `sampler.rs`:
+        // pub struct Sampler { rng, temperature, top_p, top_k }
+        // Fields are private by default if not pub.
+        // I need to check sampler.rs again.
+
+        let stream = self.device.default_stream();
+
+        if sampler.is_greedy() {
+            self.cuda_functions.apply_argmax(
+                &stream,
+                &self.buffers.logits,
+                &mut self.sample_indices_buffer,
+                self.config.vocab_size,
+            )?;
+            let host_idx = stream.clone_dtoh(&self.sample_indices_buffer)?;
+            return Ok(host_idx[0]);
+        }
+
+        let host_data = stream.clone_dtoh(&self.buffers.logits)?;
+        let mut logits: Vec<f32> = host_data.into_iter().map(|x: bf16| x.to_f32()).collect();
+        sampler.sample(&mut logits)
     }
 
     fn forward_layer(

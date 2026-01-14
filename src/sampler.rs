@@ -23,6 +23,10 @@ impl Sampler {
         }
     }
 
+    pub fn is_greedy(&self) -> bool {
+        self.temperature == 0.0
+    }
+
     pub fn sample(&mut self, logits: &mut [f32]) -> Result<u32> {
         // 1. Apply Temperature
         if self.temperature == 0.0 {
