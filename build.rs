@@ -2,24 +2,12 @@ use cudarc::nvrtc::CompileOptions;
 
 fn main() {
     let project_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    println!("cargo:rerun-if-changed={}/src/kernels", project_dir);
-    println!(
-        "cargo:rerun-if-changed={}/src/kernels/activation.cu",
-        project_dir
-    );
-    println!(
-        "cargo:rerun-if-changed={}/src/kernels/kv_cache.cu",
-        project_dir
-    );
-    println!(
-        "cargo:rerun-if-changed={}/src/kernels/rmsnorm.cu",
-        project_dir
-    );
-    println!("cargo:rerun-if-changed={}/src/kernels/rope.cu", project_dir);
-    println!(
-        "cargo:rerun-if-changed={}/src/kernels/embedding.cu",
-        project_dir
-    );
+    println!("cargo:rerun-if-changed={project_dir}/src/kernels");
+    println!("cargo:rerun-if-changed={project_dir}/src/kernels/activation.cu");
+    println!("cargo:rerun-if-changed={project_dir}/src/kernels/kv_cache.cu");
+    println!("cargo:rerun-if-changed={project_dir}/src/kernels/rmsnorm.cu");
+    println!("cargo:rerun-if-changed={project_dir}/src/kernels/rope.cu");
+    println!("cargo:rerun-if-changed={project_dir}/src/kernels/embedding.cu");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dst_path = std::path::Path::new(&out_dir);
@@ -32,11 +20,11 @@ fn main() {
         "rope.cu",
     ];
     for kernel in kernels {
-        let ptx_path = dst_path.join(format!("{}.ptx", kernel));
+        let ptx_path = dst_path.join(format!("{kernel}.ptx"));
         if ptx_path.exists() {
             std::fs::remove_file(&ptx_path).unwrap();
         }
-        let source = std::fs::read_to_string(format!("src/kernels/{}", kernel)).unwrap();
+        let source = std::fs::read_to_string(format!("src/kernels/{kernel}")).unwrap();
         let opts = CompileOptions {
             include_paths: vec!["/usr/local/cuda/include".to_string()],
             ..Default::default()

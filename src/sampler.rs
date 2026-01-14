@@ -10,9 +10,13 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    pub fn new(seed: u64, temperature: f32, top_p: f32, top_k: usize) -> Self {
+    pub fn new(seed: Option<u64>, temperature: f32, top_p: f32, top_k: usize) -> Self {
+        let rng = match seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_os_rng(),
+        };
         Self {
-            rng: StdRng::seed_from_u64(seed),
+            rng,
             temperature,
             top_p,
             top_k,

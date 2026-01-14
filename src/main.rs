@@ -22,7 +22,8 @@ fn main() -> Result<()> {
     println!("Model loaded successfully.");
 
     // 3. Configure Sampler (Temp=0.8, Top-P=0.9)
-    let mut sampler = Sampler::new(42, 0.8, 0.9, 0);
+    // let mut sampler = Sampler::new(Some(42), 0.8, 0.9, 0);
+    let mut sampler = Sampler::new(None, 0.8, 0.9, 0);
 
     let prompt = "请介绍一下量子计算的基本原理。";
     // 4. Chat Template
