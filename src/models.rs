@@ -27,6 +27,8 @@ pub struct ModelConfig {
     pub intermediate_size: usize,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f32,
     #[serde(default)]
     pub model_type: String,
     pub eos_token_id: u32,
@@ -36,6 +38,10 @@ pub struct ModelConfig {
 
 fn default_rope_theta() -> f32 {
     1000000.0
+}
+
+fn default_rms_norm_eps() -> f32 {
+    1e-6
 }
 
 pub struct LayerWeights {
@@ -779,6 +785,7 @@ impl Qwen2Model {
         let num_q_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let intermediate_size = self.config.intermediate_size;
+        let rms_norm_eps = self.config.rms_norm_eps;
 
         let funcs = &self.cuda_functions;
         let rope = &self.rope;
@@ -805,7 +812,7 @@ impl Qwen2Model {
                     &mut buffers.norm_buffer,
                     Some(&buffers.hidden_states),
                     &layer.input_layernorm,
-                    1e-6,
+                    rms_norm_eps,
                 )?;
 
                 unsafe {
@@ -909,7 +916,7 @@ impl Qwen2Model {
                     &mut buffers.norm_buffer,
                     Some(&buffers.hidden_states),
                     &layer.post_attention_layernorm,
-                    1e-6,
+                    rms_norm_eps,
                 )?;
 
                 unsafe {
@@ -969,7 +976,7 @@ impl Qwen2Model {
                 &mut buffers.hidden_states,
                 None,
                 &self.final_norm,
-                1e-6,
+                rms_norm_eps,
             )?;
             stream.synchronize()?;
             return Ok(());
@@ -1006,7 +1013,7 @@ impl Qwen2Model {
                 &mut norm_buffer,
                 Some(&hidden_states),
                 &layer.input_layernorm,
-                1e-6,
+                rms_norm_eps,
             )?;
 
             // 2. Batched QKV Proj
@@ -1122,7 +1129,7 @@ impl Qwen2Model {
                 &mut norm_buffer,
                 Some(&hidden_states),
                 &layer.post_attention_layernorm,
-                1e-6,
+                rms_norm_eps,
             )?;
 
             unsafe {
@@ -1177,7 +1184,7 @@ impl Qwen2Model {
             &mut hidden_states,
             None,
             &self.final_norm,
-            1e-6,
+            rms_norm_eps,
         )?;
 
         // Extract last token state
