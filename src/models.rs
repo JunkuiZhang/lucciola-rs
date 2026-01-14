@@ -550,6 +550,35 @@ impl Qwen2Model {
 }
 
 impl Qwen2Model {
+    fn apply_batched_embedding(
+        cuda_functions: &CudaFunctions,
+        stream: &Arc<CudaStream>,
+        embedding_table: &CudaSlice<bf16>,
+        input_ids: &CudaSlice<u32>,
+        output_hidden_states: &mut CudaSlice<bf16>,
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let launch_config = LaunchConfig {
+            grid_dim: (seq_len as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hidden_dim_i = hidden_dim as i32;
+
+        let mut build = stream.launch_builder(&cuda_functions.batched_embedding);
+        build
+            .arg(embedding_table)
+            .arg(input_ids)
+            .arg(output_hidden_states)
+            .arg(&hidden_dim_i);
+
+        unsafe {
+            build.launch(launch_config)?;
+        }
+        Ok(())
+    }
+
     fn apply_rmsnorm(
         cuda_functions: &CudaFunctions,
         stream: &Arc<CudaStream>,
@@ -986,15 +1015,18 @@ impl Qwen2Model {
         let mut hidden_states = stream.alloc_zeros::<bf16>(seq_len * hidden_dim)?;
 
         // 1. Batched Embedding
-        for (t, &id) in input_ids.iter().enumerate() {
-            let offset = t * hidden_dim; // Destination offset (row t)
-            let embed_offset = (id as usize) * hidden_dim;
-            let embed_view = self
-                .embed_tokens
-                .slice(embed_offset..embed_offset + hidden_dim);
-            let mut hidden_sub = hidden_states.slice_mut(offset..offset + hidden_dim);
-            stream.memcpy_dtod(&embed_view, &mut hidden_sub)?;
-        }
+        let mut input_ids_dev = stream.alloc_zeros::<u32>(seq_len)?;
+        stream.memcpy_htod(input_ids, &mut input_ids_dev)?;
+
+        Self::apply_batched_embedding(
+            funcs,
+            &stream,
+            &self.embed_tokens,
+            &input_ids_dev,
+            &mut hidden_states,
+            hidden_dim,
+            seq_len,
+        )?;
 
         // Allocate Batched Buffers
         let mut norm_buffer = stream.alloc_zeros::<bf16>(seq_len * hidden_dim)?;

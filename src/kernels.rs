@@ -11,6 +11,7 @@ use crate::ptx;
 pub(crate) struct CudaFunctions {
     pub(crate) activation: CudaFunction,
     pub(crate) attention: CudaFunction,
+    pub(crate) batched_embedding: CudaFunction,
     pub(crate) rmsnorm: CudaFunction,
     pub(crate) rope: CudaFunction,
 }
@@ -31,6 +32,9 @@ impl CudaFunctions {
             }
         };
         let attention = load_cuda_funtion(context, ptx::ATTENTION_PTX, attention)?;
+        println!("Loading embedding kernel...");
+        let batched_embedding =
+            load_cuda_funtion(context, ptx::EMBEDDING_PTX, "batched_embedding_kernel")?;
         println!("Loading rmsnorm kernel...");
         let rmsnorm = load_cuda_funtion(context, ptx::RMSNORM_PTX, "rmsnorm_nvidia")?;
         println!("Loading rope kernel...");
@@ -40,6 +44,7 @@ impl CudaFunctions {
         Ok(Self {
             activation,
             attention,
+            batched_embedding,
             rmsnorm,
             rope,
         })

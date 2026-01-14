@@ -16,12 +16,17 @@ fn main() {
         project_dir
     );
     println!("cargo:rerun-if-changed={}/src/kernels/rope.cu", project_dir);
+    println!(
+        "cargo:rerun-if-changed={}/src/kernels/embedding.cu",
+        project_dir
+    );
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dst_path = std::path::Path::new(&out_dir);
     let kernels = [
         "activation.cu",
         "attention.cu",
+        "embedding.cu",
         "kv_cache.cu",
         "rmsnorm.cu",
         "rope.cu",

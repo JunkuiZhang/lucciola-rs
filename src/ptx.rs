@@ -4,6 +4,9 @@ pub(crate) static ACTIVATION_PTX: &'static str =
 pub(crate) static ATTENTION_PTX: &'static str =
     include_str!(concat!(env!("OUT_DIR"), "/attention.cu.ptx"));
 
+pub(crate) static EMBEDDING_PTX: &'static str =
+    include_str!(concat!(env!("OUT_DIR"), "/embedding.cu.ptx"));
+
 pub(crate) static KV_CACHE_PTX: &'static str =
     include_str!(concat!(env!("OUT_DIR"), "/kv_cache.cu.ptx"));
 
