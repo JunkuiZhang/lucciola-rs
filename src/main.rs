@@ -4,7 +4,6 @@ use tokenizers::Tokenizer;
 use lucciola::chat::ChatTemplate;
 use lucciola::models::Qwen2Model;
 use lucciola::sampler::Sampler;
-use lucciola::streamer::Streamer;
 
 fn main() -> Result<()> {
     let model_path = "/app/lucciola/models/Qwen2.5-0.5B-Instruct";
@@ -40,13 +39,9 @@ fn main() -> Result<()> {
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    let mut streamer = Streamer::new(&tokenizer);
-
-    model.generate(&input_ids, &mut sampler, 512, |token_id| {
-        if let Some(text) = streamer.put(token_id) {
-            print!("{}", text);
-            let _ = std::io::stdout().flush();
-        }
+    model.generate(&input_ids, &mut sampler, 512, &tokenizer, |text| {
+        print!("{}", text);
+        let _ = std::io::stdout().flush();
         true // continue
     })?;
     println!();

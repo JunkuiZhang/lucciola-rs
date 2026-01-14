@@ -15,6 +15,8 @@ use std::{fs::File, path::Path, sync::Arc};
 
 use crate::kernels::{CudaFunctions, load_cuda_funtion};
 use crate::ptx::KV_CACHE_PTX;
+use crate::streamer::Streamer;
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
@@ -264,11 +266,12 @@ impl Qwen2Model {
         prompt_ids: &[u32],
         sampler: &mut crate::sampler::Sampler,
         max_new_tokens: usize,
-        token_callback: impl FnMut(u32) -> bool,
+        tokenizer: &Tokenizer,
+        mut token_callback: impl FnMut(&str) -> bool,
     ) -> Result<()> {
         let mut cache_pos = 0;
         let mut next_token_id = 0;
-        let mut callback = token_callback;
+        let mut streamer = Streamer::new(tokenizer);
 
         let eos_token_id = self.config.eos_token_id;
         let bos_token_id = self.config.bos_token_id;
@@ -286,8 +289,10 @@ impl Qwen2Model {
                 return Ok(());
             }
 
-            if !callback(next_token_id) {
-                return Ok(());
+            if let Some(text) = streamer.put(next_token_id) {
+                if !token_callback(&text) {
+                    return Ok(());
+                }
             }
         }
 
@@ -303,8 +308,10 @@ impl Qwen2Model {
                 break;
             }
 
-            if !callback(next_token_id) {
-                break;
+            if let Some(text) = streamer.put(next_token_id) {
+                if !token_callback(&text) {
+                    break;
+                }
             }
         }
 
