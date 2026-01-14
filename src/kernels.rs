@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr,
+    DevicePtrMut, LaunchConfig, PushKernelArg,
 };
 use half::bf16;
 
@@ -23,7 +23,7 @@ pub struct CudaFunctions {
 impl CudaFunctions {
     pub(crate) fn load(context: &Arc<CudaContext>, head_dim: usize) -> Result<Self> {
         println!("Loading activation kernel...");
-        let activation = load_cuda_funtion(context, ptx::ACTIVATION_PTX, "silu_and_mul_kernel")?;
+        let activation = load_cuda_funtion(context, ptx::ACTIVATION_PTX, "silu_and_mul_fused_kernel")?;
         println!("Loading attention kernels...");
         let attention = match head_dim {
             64 => "flash_decoding_kernel_64",
@@ -122,25 +122,25 @@ impl CudaFunctions {
         Ok(())
     }
 
-    pub fn apply_activation(
+    pub fn apply_activation_fused(
         &self,
         stream: &Arc<CudaStream>,
-        out: &mut CudaSlice<bf16>,
-        gate: Option<&CudaSlice<bf16>>,
-        up: &CudaSlice<bf16>,
+        gate_up_buffer: &mut CudaSlice<bf16>,
+        seq_len: usize,
+        intermediate_size: usize,
     ) -> Result<()> {
-        let n = out.len() as i32;
-        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let total_elements = seq_len * intermediate_size;
+        let cfg = LaunchConfig::for_num_elems(total_elements as u32);
+        
+        // Kernel args: buffer, rows (seq_len), cols (intermediate_size)
+        // thread_id -> index in [0, total_elements)
+        let n_elements_i32 = total_elements as i32;
+        let mid_stride_i32 = intermediate_size as i32;
 
-        let out_ptr = out.device_ptr_mut(stream).0;
-        let gate_ptr = if let Some(g) = gate {
-            g.device_ptr(stream).0
-        } else {
-            out_ptr
-        };
+        let ptr = gate_up_buffer.device_ptr_mut(stream).0;
 
         let mut build = stream.launch_builder(&self.activation);
-        build.arg(&out_ptr).arg(&gate_ptr).arg(up).arg(&n);
+        build.arg(&ptr).arg(&mid_stride_i32).arg(&n_elements_i32);
 
         unsafe {
             build.launch(cfg)?;
@@ -152,12 +152,11 @@ impl CudaFunctions {
         &self,
         rope: &RopeCache,
         stream: &Arc<CudaStream>,
-        q: &mut CudaSlice<bf16>,
-        q_offset: usize,
-        q_bias: &CudaSlice<bf16>,
-        k: &mut CudaSlice<bf16>,
-        k_offset: usize,
-        k_bias: &CudaSlice<bf16>,
+        qkv: &mut CudaViewMut<'_, bf16>,
+        q_start_idx: usize,
+        k_start_idx: usize,
+        q_bias: &CudaView<'_, bf16>,
+        k_bias: &CudaView<'_, bf16>,
         pos: usize,
         head_dim: usize,
         num_q_heads: usize,
@@ -171,15 +170,17 @@ impl CudaFunctions {
         let num_q_heads_i32 = num_q_heads as i32;
         let num_k_heads_i32 = num_k_heads as i32;
 
-        // Use slice_mut. CudaViewMut implements DevicePtrMut AND DevicePtr.
-        let mut q_view = q.slice_mut(q_offset..q_offset + (num_q_heads * head_dim));
-        let mut k_view = k.slice_mut(k_offset..k_offset + (num_k_heads * head_dim));
+        let (base_ptr, _guard) = qkv.device_ptr(stream);
+        // 2 bytes per bf16
+        // Pointer arithmetic: we need to trust the caller that q_start_idx/k_start_idx are within qkv.
+        let q_ptr = base_ptr + (q_start_idx * 2) as u64;
+        let k_ptr = base_ptr + (k_start_idx * 2) as u64;
 
         let mut builder = stream.launch_builder(&self.rope);
         builder
-            .arg(&mut q_view)
+            .arg(&q_ptr)
             .arg(q_bias)
-            .arg(&mut k_view)
+            .arg(&k_ptr)
             .arg(k_bias)
             .arg(&rope.cos)
             .arg(&rope.sin)

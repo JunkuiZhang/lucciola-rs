@@ -7,12 +7,9 @@ use crate::config::ModelConfig;
 
 pub struct InferenceBuffers {
     pub hidden_states: CudaSlice<bf16>,
-    pub q_states: CudaSlice<bf16>,
-    pub k_states: CudaSlice<bf16>,
-    pub v_states: CudaSlice<bf16>,
+    pub qkv_states: CudaSlice<bf16>,
     pub att_output: CudaSlice<bf16>,
-    pub mlp_gate: CudaSlice<bf16>,
-    pub mlp_up: CudaSlice<bf16>,
+    pub gate_up_states: CudaSlice<bf16>,
     pub norm_buffer: CudaSlice<bf16>,
     pub scores_buf: CudaSlice<bf16>,
 }
@@ -25,13 +22,15 @@ impl InferenceBuffers {
         let intermediate_size = config.intermediate_size;
 
         let hidden_states = stream.alloc_zeros::<bf16>(hidden_dim)?;
-        let q_states = stream.alloc_zeros::<bf16>(hidden_dim)?;
-        let k_states = stream.alloc_zeros::<bf16>(num_kv_heads * head_dim)?;
-        let v_states = stream.alloc_zeros::<bf16>(num_kv_heads * head_dim)?;
+
+        let q_size = hidden_dim;
+        let k_size = num_kv_heads * head_dim;
+        let v_size = num_kv_heads * head_dim;
+        let qkv_states = stream.alloc_zeros::<bf16>(q_size + k_size + v_size)?;
+
         let att_output = stream.alloc_zeros::<bf16>(hidden_dim)?;
 
-        let mlp_gate = stream.alloc_zeros::<bf16>(intermediate_size)?;
-        let mlp_up = stream.alloc_zeros::<bf16>(intermediate_size)?;
+        let gate_up_states = stream.alloc_zeros::<bf16>(2 * intermediate_size)?;
 
         let norm_buffer = stream.alloc_zeros::<bf16>(hidden_dim)?;
 
@@ -42,12 +41,9 @@ impl InferenceBuffers {
 
         Ok(Self {
             hidden_states,
-            q_states,
-            k_states,
-            v_states,
+            qkv_states,
             att_output,
-            mlp_gate,
-            mlp_up,
+            gate_up_states,
             norm_buffer,
             scores_buf,
         })

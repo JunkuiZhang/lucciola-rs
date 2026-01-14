@@ -9,3 +9,7 @@ avg Latency: 4.86ms per token
 Fused FlashDecoding: TTFT: 130.02ms
 Throughout: 206.62 tokens/sec
 avg Latency: 4.84ms per token
+
+Fused Kernel: TTFT: 128.91ms
+Throughout: 219.46 tokens/sec
+avg Latency: 4.56ms per token

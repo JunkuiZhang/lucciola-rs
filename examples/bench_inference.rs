@@ -48,7 +48,7 @@ fn main() -> Result<()> {
 
     // --- Benchmarking Generation ---
     println!("Benchmarking Generation (50 tokens)...");
-    let n_gen = 50;
+    let n_gen = 200;
 
     // Get last token from input to start generation (though we verify sample next)
     // Actually we pick the token from the sample() result usually, but here for simple bench

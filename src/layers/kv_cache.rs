@@ -1,5 +1,7 @@
 use anyhow::Result;
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg,
+};
 use half::bf16;
 use std::sync::Arc;
 
@@ -100,11 +102,11 @@ impl KVCache {
         stream: &Arc<CudaStream>,
         layer_idx: usize,
         pos: usize,
-        k_input: &CudaSlice<bf16>,
+        k_input: &CudaView<'_, bf16>,
         k_offset: usize,
-        v_input: &CudaSlice<bf16>,
+        v_input: &CudaView<'_, bf16>,
         v_offset: usize,
-        v_bias: &CudaSlice<bf16>,
+        v_bias: &CudaView<'_, bf16>,
     ) -> Result<()> {
         let logical_block_idx = pos / self.block_size;
 
