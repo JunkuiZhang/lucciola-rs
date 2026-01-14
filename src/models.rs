@@ -304,10 +304,8 @@ impl Qwen2Model {
             );
         }
 
-        let mut host_data = vec![bf16::default(); vocab_size];
-        stream.memcpy_dtoh(&logits, &mut host_data)?;
-        stream.synchronize()?;
-        Ok(host_data.iter().map(|x: &bf16| x.to_f32()).collect())
+        let host_data = stream.clone_dtoh(&logits)?;
+        Ok(host_data.into_iter().map(|x: bf16| x.to_f32()).collect())
     }
 
     fn forward_layer(
@@ -563,7 +561,6 @@ impl Qwen2Model {
                 &self.final_norm,
                 rms_norm_eps,
             )?;
-            stream.synchronize()?;
             return Ok(());
         }
 
@@ -571,8 +568,7 @@ impl Qwen2Model {
         let mut hidden_states = stream.alloc_zeros::<bf16>(seq_len * hidden_dim)?;
 
         // 1. Batched Embedding
-        let mut input_ids_dev = stream.alloc_zeros::<u32>(seq_len)?;
-        stream.memcpy_htod(input_ids, &mut input_ids_dev)?;
+        let input_ids_dev = stream.clone_htod(input_ids)?;
 
         funcs.apply_batched_embedding(
             &stream,
@@ -635,7 +631,6 @@ impl Qwen2Model {
         let last_token_state = hidden_states.slice(last_offset..last_offset + hidden_dim);
         stream.memcpy_dtod(&last_token_state, &mut self.buffers.hidden_states)?;
 
-        stream.synchronize()?;
         Ok(())
     }
 }
