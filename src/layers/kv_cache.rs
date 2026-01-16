@@ -97,17 +97,7 @@ impl KVCache {
         })
     }
 
-    pub fn update(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        layer_idx: usize,
-        pos: usize,
-        k_input: &CudaView<'_, bf16>,
-        k_offset: usize,
-        v_input: &CudaView<'_, bf16>,
-        v_offset: usize,
-        v_bias: &CudaView<'_, bf16>,
-    ) -> Result<()> {
+    pub fn prepare_for_step(&mut self, stream: &Arc<CudaStream>, pos: usize) -> Result<()> {
         let logical_block_idx = pos / self.block_size;
 
         if logical_block_idx >= self.block_table_cpu.len() {
@@ -122,6 +112,22 @@ impl KVCache {
                 &mut self.block_table.slice_mut(0..self.block_table_cpu.len()),
             )?;
         }
+        Ok(())
+    }
+
+    pub fn update(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        layer_idx: usize,
+        pos: usize,
+        pos_ptr: &CudaSlice<i32>,
+        k_input: &CudaView<'_, bf16>,
+        k_offset: usize,
+        v_input: &CudaView<'_, bf16>,
+        v_offset: usize,
+        v_bias: &CudaView<'_, bf16>,
+    ) -> Result<()> {
+        self.prepare_for_step(stream, pos)?;
 
         let cfg = LaunchConfig {
             grid_dim: (self.num_kv_heads as u32, 1, 1),
@@ -134,7 +140,7 @@ impl KVCache {
 
         let mut builder = stream.launch_builder(&self.cuda_function);
         let layer_idx = layer_idx as i32;
-        let pos = pos as i32;
+        // let pos = pos as i32; // Removed
         let num_layers = self.num_layers as i32;
         let num_kv_heads = self.num_kv_heads as i32;
         let max_seq_len = self.max_seq_len as i32;
@@ -149,7 +155,7 @@ impl KVCache {
             .arg(v_bias)
             .arg(&self.block_table)
             .arg(&layer_idx)
-            .arg(&pos)
+            .arg(pos_ptr)
             .arg(&num_layers)
             .arg(&num_kv_heads)
             .arg(&max_seq_len)

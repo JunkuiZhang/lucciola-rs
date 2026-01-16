@@ -3,7 +3,9 @@ use cudarc::cublas::CudaBlas;
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
 };
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
+};
 use half::bf16;
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
@@ -30,6 +32,7 @@ struct ForwardPassBuffers<'a> {
 
 pub struct Qwen2Model {
     pub device: Arc<CudaContext>,
+    pub stream: Arc<CudaStream>,
     pub blas: Arc<CudaBlas>,
     pub embed_tokens: CudaSlice<bf16>,
     pub lm_head: CudaSlice<bf16>,
@@ -42,12 +45,14 @@ pub struct Qwen2Model {
     pub config: ModelConfig,
     pub sample_indices_buffer: CudaSlice<u32>,
     pub sort_buffer: CudaSlice<u8>, // Temporary buffer for sort
+    pub pos_buffer: CudaSlice<i32>,
 }
 
 impl Qwen2Model {
     pub fn load(gpu_id: usize, path: impl AsRef<Path>) -> Result<Self> {
         let device = CudaContext::new(gpu_id)?;
-        let blas = Arc::new(CudaBlas::new(device.default_stream())?);
+        let stream = device.new_stream()?;
+        let blas = Arc::new(CudaBlas::new(stream.clone())?);
 
         let config_file = path.as_ref().join("config.json");
         let config: ModelConfig = serde_json::from_reader(std::fs::File::open(config_file)?)?;
@@ -56,8 +61,6 @@ impl Qwen2Model {
         let tensors_file = File::open(path.as_ref().join("model.safetensors"))?;
         let mmap = unsafe { MmapOptions::new().map(&tensors_file)? };
         let tensors = SafeTensors::deserialize(&mmap)?;
-        let stream = device.default_stream();
-
         let embed_tokens = get_tensor(&stream, &tensors, "model.embed_tokens.weight")?;
         let lm_head = if config.tie_word_embeddings {
             embed_tokens.clone()
@@ -139,9 +142,11 @@ impl Qwen2Model {
         // It only needs to hold 1024 KeyValuePairs (8KB).
         // Let's alloc 1024 * 8 bytes = 8192 bytes.
         let sort_buffer = stream.alloc_zeros::<u8>(1024 * 8)?;
+        let pos_buffer = stream.alloc_zeros::<i32>(1)?;
 
         Ok(Qwen2Model {
             device,
+            stream,
             blas,
             embed_tokens,
             lm_head,
@@ -154,6 +159,7 @@ impl Qwen2Model {
             config,
             sample_indices_buffer,
             sort_buffer,
+            pos_buffer,
         })
     }
     pub fn generate(
@@ -306,7 +312,7 @@ impl Qwen2Model {
     }
 
     pub fn compute_logits(&mut self) -> Result<()> {
-        let stream = self.device.default_stream();
+        let stream = self.stream.clone();
         let vocab_size = self.config.vocab_size;
         let hidden_dim = self.config.hidden_size;
 
@@ -357,7 +363,7 @@ impl Qwen2Model {
         // Fields are private by default if not pub.
         // I need to check sampler.rs again.
 
-        let stream = self.device.default_stream();
+        let stream = self.stream.clone();
 
         if sampler.is_greedy() {
             self.cuda_functions.apply_argmax(
@@ -407,6 +413,7 @@ impl Qwen2Model {
         i: usize,
         seq_len: usize,
         cache_pos: usize,
+        pos_ptr: &mut CudaSlice<i32>,
         bufs: &mut ForwardPassBuffers,
     ) -> Result<()> {
         let hidden_dim = config.hidden_size;
@@ -449,30 +456,22 @@ impl Qwen2Model {
         // 3. Serial Loop for Attention/RoPE/Cache
         for t in 0..seq_len {
             let current_pos = cache_pos + t;
-
-            // For fused buffer: [seq_len, qkv_dim]
-            // We need to slice Q, K, V parts for the current token (or sequence of tokens if we were doing flash attn, but here we loop t)
-            // Wait, RoPE and logic below assume accessing data for ONE token at time 't' if seq_len > 1?
-            // "bufs.qkv_states" holds [seq_len, Q+K+V]
-            // RoPE expects: &mut q_states, q_offset
-
-            // QKV layout in memory:
-            // Row 0: [Q0... | K0... | V0...]
-            // Row 1: [Q1... | K1... | V1...]
+            
+            // For Prefill (seq_len > 1), we must update pos_ptr eagerly.
+            // For Decode (seq_len == 1), pos_ptr is updated by caller (to support Graph Capture).
+            if seq_len > 1 {
+                 stream.memcpy_htod(&[current_pos as i32], pos_ptr)?;
+            }
 
             let row_offset = t * qkv_output_dim;
             let q_offset = row_offset;
             let k_offset = row_offset + q_size_1d;
             let v_offset = row_offset + q_size_1d + k_size_1d;
 
-            // We need to construct temporary slices to q_bias, k_bias, v_bias from qkv_bias
-            // qkv_bias is [Q+K+V]
             let q_bias_view = layer.qkv_bias.slice(0..q_size_1d);
             let k_bias_view = layer.qkv_bias.slice(q_size_1d..q_size_1d + k_size_1d);
             let v_bias_view = layer.qkv_bias.slice(q_size_1d + k_size_1d..qkv_output_dim);
 
-            // RoPE & KV Update & Attention
-            // Note: RoPE modifies Q and K in place.
             {
                 let mut qkv_view_mut = bufs.qkv_states.slice_mut(0..bufs.qkv_states.len());
                 funcs.apply_rope(
@@ -483,14 +482,13 @@ impl Qwen2Model {
                     k_offset,
                     &q_bias_view,
                     &k_bias_view,
-                    current_pos,
+                    pos_ptr,
                     head_dim,
                     num_q_heads,
                     num_kv_heads,
                 )?;
             }
 
-            // KV Cache Update: needs to copy from K/V states to Cache
             let k_input_view = bufs.qkv_states.slice(k_offset..k_offset + k_size_1d);
             let v_input_view = bufs.qkv_states.slice(v_offset..v_offset + k_size_1d);
 
@@ -498,6 +496,7 @@ impl Qwen2Model {
                 stream,
                 i,
                 current_pos,
+                pos_ptr,
                 &k_input_view,
                 0,
                 &v_input_view,
@@ -514,6 +513,7 @@ impl Qwen2Model {
                 kv_cache,
                 i,
                 current_pos,
+                pos_ptr,
                 head_dim,
                 num_q_heads,
                 num_kv_heads,
@@ -662,7 +662,7 @@ impl Qwen2Model {
     }
 
     pub fn forward(&mut self, input_ids: &[u32], cache_pos: usize) -> Result<()> {
-        let stream = self.device.default_stream();
+        let stream = self.stream.clone();
         let blas = &*self.blas;
 
         let seq_len = input_ids.len();
@@ -682,7 +682,10 @@ impl Qwen2Model {
         if seq_len == 1 {
             let token_id = input_ids[0] as usize;
 
-            // 1. Embedding
+            // 0. Update Pos Buffer (needed for both Eager and Graph)
+            stream.memcpy_htod(&[cache_pos as i32], &mut self.pos_buffer)?;
+
+            // 1. Embedding (Eager)
             let embed_offset = token_id * hidden_dim;
             {
                 let embed_view = self
@@ -691,6 +694,10 @@ impl Qwen2Model {
                 stream.memcpy_dtod(&embed_view, &mut self.buffers.hidden_states)?;
             }
 
+            // 2. KVCache Allocation Check (Eager)
+            self.kv_cache.prepare_for_step(&stream, cache_pos)?;
+
+            // 3. Eager Logic (Graph removed due to stream isolation issues with CuBLAS)
             let mut bufs = ForwardPassBuffers {
                 hidden_states: &mut self.buffers.hidden_states,
                 norm_buffer: &mut self.buffers.norm_buffer,
@@ -711,6 +718,7 @@ impl Qwen2Model {
                     i,
                     1,
                     cache_pos,
+                    &mut self.pos_buffer,
                     &mut bufs,
                 )?;
             }
@@ -768,6 +776,7 @@ impl Qwen2Model {
                     i,
                     seq_len,
                     cache_pos,
+                    &mut self.pos_buffer,
                     &mut bufs,
                 )?;
             }

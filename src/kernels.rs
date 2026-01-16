@@ -209,7 +209,7 @@ impl CudaFunctions {
         k_start_idx: usize,
         q_bias: &CudaView<'_, bf16>,
         k_bias: &CudaView<'_, bf16>,
-        pos: usize,
+        pos_ptr: &CudaSlice<i32>,
         head_dim: usize,
         num_q_heads: usize,
         num_k_heads: usize,
@@ -217,7 +217,6 @@ impl CudaFunctions {
         let total_threads = num_q_heads * (head_dim / 2);
         let cfg = LaunchConfig::for_num_elems(total_threads as u32);
 
-        let pos = pos as i32;
         let head_dim_i32 = head_dim as i32;
         let num_q_heads_i32 = num_q_heads as i32;
         let num_k_heads_i32 = num_k_heads as i32;
@@ -236,7 +235,7 @@ impl CudaFunctions {
             .arg(k_bias)
             .arg(&rope.cos)
             .arg(&rope.sin)
-            .arg(&pos)
+            .arg(pos_ptr)
             .arg(&head_dim_i32)
             .arg(&num_q_heads_i32)
             .arg(&num_k_heads_i32);
@@ -256,6 +255,7 @@ impl CudaFunctions {
         cache: &KVCache,
         layer_idx: usize,
         pos: usize,
+        pos_ptr: &CudaSlice<i32>,
         head_dim: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -293,7 +293,6 @@ impl CudaFunctions {
         let num_q_heads_i32 = num_q_heads as i32;
         let num_kv_heads_i32 = num_kv_heads as i32;
         let head_dim_i32 = head_dim as i32;
-        let current_pos = pos as i32;
 
         let block_size_i32 = cache.block_size as i32;
         let num_layers_i32 = cache.num_layers as i32;
@@ -309,7 +308,7 @@ impl CudaFunctions {
             .arg(&num_kv_heads_i32)
             .arg(&head_dim_i32)
             .arg(&max_seq_len)
-            .arg(&current_pos)
+            .arg(pos_ptr)
             .arg(&scale)
             .arg(&block_size_i32)
             .arg(&num_layers_i32);
