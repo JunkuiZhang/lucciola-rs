@@ -266,17 +266,9 @@ impl CudaFunctions {
         let current_num_blocks = (pos + cache.block_size) / cache.block_size;
         let block_table_bytes = current_num_blocks * 4;
 
-        let num_warps = 4; // BlockDim 128 / 32 = 4
-        // Shared Mem Layout:
-        // 1. Q: [head_dim] floats
-        // 2. BlockTable: [num_blocks] ints
-        // 3. Reduction buffer: [num_warps * head_dim] floats (for O)
-        // 4. Reduction buffer: [num_warps] floats (for M)
-        // 5. Reduction buffer: [num_warps] floats (for L)
-        // Total = (64*4) + (N*4) + (4*64*4) + (4*4) + (4*4)
-        // For head_dim=64, num_warps=4:
-        // 256 + N*4 + 1024 + 16 + 16 = 1312 + N*4.
-        // Original was: 256 + N*4 + 128.
+        let num_warps = 32; // BlockDim 1024 / 32 = 32
+        // Shared Mem Layout uses num_warps
+
         let smem_o_bytes = num_warps * head_dim * 4;
         let smem_m_bytes = num_warps * 4;
         let smem_l_bytes = num_warps * 4;
