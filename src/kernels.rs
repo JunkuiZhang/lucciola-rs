@@ -20,7 +20,12 @@ pub struct CudaFunctions {
     pub(crate) rope: CudaFunction,
     pub(crate) sampling: CudaFunction,
     pub(crate) top_k_filter: CudaFunction,
-    pub(crate) fused_top_p_sample: CudaFunction,
+    pub(crate) fused_top_p_sample_32: CudaFunction,
+    pub(crate) fused_top_p_sample_64: CudaFunction,
+    pub(crate) fused_top_p_sample_128: CudaFunction,
+    pub(crate) fused_top_p_sample_256: CudaFunction,
+    pub(crate) fused_top_p_sample_512: CudaFunction,
+    pub(crate) fused_top_p_sample_1024: CudaFunction,
 }
 
 impl CudaFunctions {
@@ -51,8 +56,36 @@ impl CudaFunctions {
         let sampling = load_cuda_funtion(context, ptx::SAMPLING_PTX, "argmax_kernel")?;
         println!("Loading optimized sampling kernels...");
         let top_k_filter = load_cuda_funtion(context, ptx::SAMPLING_OPTIMIZED_PTX, "top_k_filter")?;
-        let fused_top_p_sample =
-            load_cuda_funtion(context, ptx::SAMPLING_OPTIMIZED_PTX, "fused_top_p_sample")?;
+        let fused_top_p_sample_32 = load_cuda_funtion(
+            context,
+            ptx::SAMPLING_OPTIMIZED_PTX,
+            "fused_top_p_sample_32",
+        )?;
+        let fused_top_p_sample_64 = load_cuda_funtion(
+            context,
+            ptx::SAMPLING_OPTIMIZED_PTX,
+            "fused_top_p_sample_64",
+        )?;
+        let fused_top_p_sample_128 = load_cuda_funtion(
+            context,
+            ptx::SAMPLING_OPTIMIZED_PTX,
+            "fused_top_p_sample_128",
+        )?;
+        let fused_top_p_sample_256 = load_cuda_funtion(
+            context,
+            ptx::SAMPLING_OPTIMIZED_PTX,
+            "fused_top_p_sample_256",
+        )?;
+        let fused_top_p_sample_512 = load_cuda_funtion(
+            context,
+            ptx::SAMPLING_OPTIMIZED_PTX,
+            "fused_top_p_sample_512",
+        )?;
+        let fused_top_p_sample_1024 = load_cuda_funtion(
+            context,
+            ptx::SAMPLING_OPTIMIZED_PTX,
+            "fused_top_p_sample_1024",
+        )?;
 
         println!("Loading formatted kernels done.");
 
@@ -64,7 +97,12 @@ impl CudaFunctions {
             rope,
             sampling,
             top_k_filter,
-            fused_top_p_sample,
+            fused_top_p_sample_32,
+            fused_top_p_sample_64,
+            fused_top_p_sample_128,
+            fused_top_p_sample_256,
+            fused_top_p_sample_512,
+            fused_top_p_sample_1024,
         })
     }
 
@@ -303,6 +341,7 @@ impl CudaFunctions {
         sort_buffer: &mut CudaSlice<u8>,
         vocab_size: usize,
         top_p: f32,
+        top_k: usize,
         rand_val: f32,
     ) -> Result<()> {
         let n: u32 = 1u32 << (32 - (vocab_size as u32 - 1).leading_zeros());
@@ -310,11 +349,20 @@ impl CudaFunctions {
         let vocab_size_i32 = vocab_size as i32;
 
         // New Logic: 2 Kernels.
-        // 1. top_k_filter: Grid=32, Block=256. Reduce 32 items per block. Total 1024.
+        // Determine candidates based on top_k
+        let target_candidates = top_k;
+
+        // Determine filter parameters
+        // To prevent shared memory overflow (CUDA_ERROR_INVALID_VALUE) at Grid=8 (for 256), we fix Grid=32.
+        // vocab_size ~ 152k. Grid=32 -> Partition=4.7k items -> 19KB shared mem -> Safe.
+
         let filter_grid = 32;
-        let filter_k_per_block = 32;
+        let filter_k_per_block = target_candidates / filter_grid;
+
+        let total_candidates = filter_grid * filter_k_per_block;
+
         let cfg_filter = LaunchConfig {
-            grid_dim: (filter_grid, 1, 1),
+            grid_dim: (filter_grid as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: ((vocab_size / filter_grid as usize) as u32 + 256) * 4, // Float size + padding
         };
@@ -330,21 +378,110 @@ impl CudaFunctions {
         }
 
         // 2. Fused Sort & Sample
-        let fused_n = 1024;
-        let cfg_fused = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (1024, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&self.fused_top_p_sample)
-                .arg(&mut *sort_buffer)
-                .arg(&fused_n)
-                .arg(&top_p)
-                .arg(&rand_val)
-                .arg(output_idx)
-                .launch(cfg_fused)?;
+        // Dynamic dispatch based on total_candidates
+        match total_candidates {
+            32 => {
+                let cfg_fused = LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&self.fused_top_p_sample_32)
+                        .arg(&mut *sort_buffer)
+                        .arg(&top_p)
+                        .arg(&rand_val)
+                        .arg(output_idx)
+                        .launch(cfg_fused)?;
+                }
+            }
+            64 => {
+                let cfg_fused = LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&self.fused_top_p_sample_64)
+                        .arg(&mut *sort_buffer)
+                        .arg(&top_p)
+                        .arg(&rand_val)
+                        .arg(output_idx)
+                        .launch(cfg_fused)?;
+                }
+            }
+            128 => {
+                let cfg_fused = LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&self.fused_top_p_sample_128)
+                        .arg(&mut *sort_buffer)
+                        .arg(&top_p)
+                        .arg(&rand_val)
+                        .arg(output_idx)
+                        .launch(cfg_fused)?;
+                }
+            }
+            256 => {
+                let cfg_fused = LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&self.fused_top_p_sample_256)
+                        .arg(&mut *sort_buffer)
+                        .arg(&top_p)
+                        .arg(&rand_val)
+                        .arg(output_idx)
+                        .launch(cfg_fused)?;
+                }
+            }
+            512 => {
+                let cfg_fused = LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&self.fused_top_p_sample_512)
+                        .arg(&mut *sort_buffer)
+                        .arg(&top_p)
+                        .arg(&rand_val)
+                        .arg(output_idx)
+                        .launch(cfg_fused)?;
+                }
+            }
+            1024 => {
+                let cfg_fused = LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&self.fused_top_p_sample_1024)
+                        .arg(&mut *sort_buffer)
+                        .arg(&top_p)
+                        .arg(&rand_val)
+                        .arg(output_idx)
+                        .launch(cfg_fused)?;
+                }
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported candidate size: {}",
+                    total_candidates
+                ));
+            }
         }
 
         Ok(())

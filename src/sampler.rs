@@ -15,7 +15,12 @@ impl Sampler {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_os_rng(),
         };
-        let top_k = if top_k == 0 { 1024 } else { top_k };
+        let top_k = if top_k == 0 {
+            1024
+        } else {
+            top_k.next_power_of_two().max(32).min(1024)
+        };
+        println!("top_k set to {}", top_k);
         Self {
             rng,
             temperature,
@@ -30,6 +35,10 @@ impl Sampler {
 
     pub fn top_p(&self) -> f32 {
         self.top_p
+    }
+
+    pub fn top_k(&self) -> usize {
+        self.top_k
     }
 
     pub fn sample(&mut self, logits: &mut [f32]) -> Result<u32> {

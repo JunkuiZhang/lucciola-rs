@@ -383,6 +383,7 @@ impl Qwen2Model {
                 &mut self.sort_buffer,
                 self.config.vocab_size,
                 p_threshold,
+                sampler.top_k(),
                 rand_val,
             )?;
             let host_idx = stream.clone_dtoh(&self.sample_indices_buffer)?;

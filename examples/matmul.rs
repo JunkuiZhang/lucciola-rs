@@ -40,5 +40,6 @@ fn main() -> Result<(), DriverError> {
 
     stream.memcpy_dtoh(&c_dev, &mut c_host)?;
     println!("Found {:?} in {:?}", c_host, start.elapsed());
+
     Ok(())
 }
