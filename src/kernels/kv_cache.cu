@@ -2,13 +2,19 @@
 
 extern "C" __global__ void update_kv_cache_kernel(
     __nv_bfloat16 *k_pool, // Base Pointer to Paged Pool
-    __nv_bfloat16 *v_pool, const __nv_bfloat16 *new_k,
-    const __nv_bfloat16 *new_v, const __nv_bfloat16 *v_bias,
+    __nv_bfloat16 *v_pool,
+    const __nv_bfloat16 *new_k,
+    const __nv_bfloat16 *new_v,
+    const __nv_bfloat16 *v_bias,
     const int *block_table, // [max_num_blocks] mapping logical->physical
-    int layer_id, const int *pos_ptr, int num_layers, int num_kv_heads,
+    int layer_id,
+    const int *pos_ptr,
+    int num_layers,
+    int num_kv_heads,
     int max_seq_len, // Not strictly needed for addressing anymore, but maybe
                      // for bound checking
-    int head_dim, int block_size) {
+    int head_dim,
+    int block_size) {
     int pos_id = *pos_ptr;
     int head_idx = blockIdx.x; // kv_head
     int dim_idx = threadIdx.x; // dim

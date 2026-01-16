@@ -2,13 +2,21 @@
 #include <cuda_runtime.h>
 
 template <int HEAD_DIM>
-__device__ void
-flash_decoding_impl(__nv_bfloat16 *output, const __nv_bfloat16 *q,
-                    const __nv_bfloat16 *k_pool, const __nv_bfloat16 *v_pool,
-                    const int *block_table, int layer_idx, int num_q_heads,
-                    int num_kv_heads, int head_dim_rt, int max_seq_len,
-                    const int *current_pos_ptr, float sm_scale, int block_size,
-                    int num_layers) {
+__device__ void flash_decoding_impl(
+    __nv_bfloat16 *output,
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k_pool,
+    const __nv_bfloat16 *v_pool,
+    const int *block_table,
+    int layer_idx,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim_rt,
+    int max_seq_len,
+    const int *current_pos_ptr,
+    float sm_scale,
+    int block_size,
+    int num_layers) {
     int current_pos = *current_pos_ptr;
     // --- Indexing ---
     int q_head_idx = blockIdx.x;
@@ -168,21 +176,65 @@ flash_decoding_impl(__nv_bfloat16 *output, const __nv_bfloat16 *q,
 }
 
 extern "C" __global__ void flash_decoding_kernel_64(
-    __nv_bfloat16 *output, const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-    const __nv_bfloat16 *v, const int *block_table, int layer_idx,
-    int num_q_heads, int num_kv_heads, int head_dim, int max_seq_len,
-    const int *current_pos, float sm_scale, int block_size, int num_layers) {
-    flash_decoding_impl<64>(output, q, k, v, block_table, layer_idx,
-                            num_q_heads, num_kv_heads, head_dim, max_seq_len,
-                            current_pos, sm_scale, block_size, num_layers);
+    __nv_bfloat16 *output,
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k,
+    const __nv_bfloat16 *v,
+    const int *block_table,
+    int layer_idx,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    const int *current_pos,
+    float sm_scale,
+    int block_size,
+    int num_layers) {
+    flash_decoding_impl<64>(
+        output,
+        q,
+        k,
+        v,
+        block_table,
+        layer_idx,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        max_seq_len,
+        current_pos,
+        sm_scale,
+        block_size,
+        num_layers);
 }
 
 extern "C" __global__ void flash_decoding_kernel_128(
-    __nv_bfloat16 *output, const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-    const __nv_bfloat16 *v, const int *block_table, int layer_idx,
-    int num_q_heads, int num_kv_heads, int head_dim, int max_seq_len,
-    const int *current_pos, float sm_scale, int block_size, int num_layers) {
-    flash_decoding_impl<128>(output, q, k, v, block_table, layer_idx,
-                             num_q_heads, num_kv_heads, head_dim, max_seq_len,
-                             current_pos, sm_scale, block_size, num_layers);
+    __nv_bfloat16 *output,
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k,
+    const __nv_bfloat16 *v,
+    const int *block_table,
+    int layer_idx,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    const int *current_pos,
+    float sm_scale,
+    int block_size,
+    int num_layers) {
+    flash_decoding_impl<128>(
+        output,
+        q,
+        k,
+        v,
+        block_table,
+        layer_idx,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        max_seq_len,
+        current_pos,
+        sm_scale,
+        block_size,
+        num_layers);
 }

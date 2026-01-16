@@ -13,9 +13,10 @@ struct ArgMaxOp {
     }
 };
 
-extern "C" __global__ void
-argmax_kernel(const __nv_bfloat16 *__restrict__ input, const int size,
-              unsigned int *__restrict__ output_idx) {
+extern "C" __global__ void argmax_kernel(
+    const __nv_bfloat16 *__restrict__ input,
+    const int size,
+    unsigned int *__restrict__ output_idx) {
     int tid = threadIdx.x;
 
     // Initialize with lowest possible value

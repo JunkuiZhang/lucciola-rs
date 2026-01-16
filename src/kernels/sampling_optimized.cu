@@ -24,11 +24,11 @@ __inline__ __device__ KeyValuePair warpReduceMax(KeyValuePair val) {
     return val;
 }
 
-extern "C" __global__ void
-top_k_filter(const __nv_bfloat16 *__restrict__ logits,
-             KeyValuePair *candidates, // Output [GridDim * K_per_block]
-             int vocab_size,
-             int k_per_block // typically 32
+extern "C" __global__ void top_k_filter(
+    const __nv_bfloat16 *__restrict__ logits,
+    KeyValuePair *candidates, // Output [GridDim * K_per_block]
+    int vocab_size,
+    int k_per_block // typically 32
 ) {
     int partition_count = gridDim.x;
     int partition_idx = blockIdx.x;
@@ -114,9 +114,11 @@ top_k_filter(const __nv_bfloat16 *__restrict__ logits,
 // --- Part 2: Fused Sort and Sample (Templated) ---
 
 template <int MAX_CANDIDATES>
-__device__ void fused_top_p_sample_impl(KeyValuePair *candidates, float top_p,
-                                        float rand_val,
-                                        unsigned int *output_idx) {
+__device__ void fused_top_p_sample_impl(
+    KeyValuePair *candidates,
+    float top_p,
+    float rand_val,
+    unsigned int *output_idx) {
     int tid = threadIdx.x;
 
     __shared__ KeyValuePair s_data[MAX_CANDIDATES];
@@ -185,38 +187,50 @@ __device__ void fused_top_p_sample_impl(KeyValuePair *candidates, float top_p,
     }
 }
 
-extern "C" __global__ void fused_top_p_sample_32(KeyValuePair *candidates,
-                                                 float top_p, float rand_val,
-                                                 unsigned int *output_idx) {
+extern "C" __global__ void fused_top_p_sample_32(
+    KeyValuePair *candidates,
+    float top_p,
+    float rand_val,
+    unsigned int *output_idx) {
     fused_top_p_sample_impl<32>(candidates, top_p, rand_val, output_idx);
 }
 
-extern "C" __global__ void fused_top_p_sample_64(KeyValuePair *candidates,
-                                                 float top_p, float rand_val,
-                                                 unsigned int *output_idx) {
+extern "C" __global__ void fused_top_p_sample_64(
+    KeyValuePair *candidates,
+    float top_p,
+    float rand_val,
+    unsigned int *output_idx) {
     fused_top_p_sample_impl<64>(candidates, top_p, rand_val, output_idx);
 }
 
-extern "C" __global__ void fused_top_p_sample_128(KeyValuePair *candidates,
-                                                  float top_p, float rand_val,
-                                                  unsigned int *output_idx) {
+extern "C" __global__ void fused_top_p_sample_128(
+    KeyValuePair *candidates,
+    float top_p,
+    float rand_val,
+    unsigned int *output_idx) {
     fused_top_p_sample_impl<128>(candidates, top_p, rand_val, output_idx);
 }
 
-extern "C" __global__ void fused_top_p_sample_256(KeyValuePair *candidates,
-                                                  float top_p, float rand_val,
-                                                  unsigned int *output_idx) {
+extern "C" __global__ void fused_top_p_sample_256(
+    KeyValuePair *candidates,
+    float top_p,
+    float rand_val,
+    unsigned int *output_idx) {
     fused_top_p_sample_impl<256>(candidates, top_p, rand_val, output_idx);
 }
 
-extern "C" __global__ void fused_top_p_sample_512(KeyValuePair *candidates,
-                                                  float top_p, float rand_val,
-                                                  unsigned int *output_idx) {
+extern "C" __global__ void fused_top_p_sample_512(
+    KeyValuePair *candidates,
+    float top_p,
+    float rand_val,
+    unsigned int *output_idx) {
     fused_top_p_sample_impl<512>(candidates, top_p, rand_val, output_idx);
 }
 
-extern "C" __global__ void fused_top_p_sample_1024(KeyValuePair *candidates,
-                                                   float top_p, float rand_val,
-                                                   unsigned int *output_idx) {
+extern "C" __global__ void fused_top_p_sample_1024(
+    KeyValuePair *candidates,
+    float top_p,
+    float rand_val,
+    unsigned int *output_idx) {
     fused_top_p_sample_impl<1024>(candidates, top_p, rand_val, output_idx);
 }

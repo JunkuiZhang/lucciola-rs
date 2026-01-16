@@ -1,13 +1,16 @@
 #include <cuda_bf16.h>
 
-extern "C" __global__ void
-rope(__nv_bfloat16 *q, // [num_heads, head_dim]
-     const __nv_bfloat16 *q_bias,
-     __nv_bfloat16 *k, // [num_kv_heads, head_dim]
-     const __nv_bfloat16 *k_bias,
-     const float *cos_cache, // [max_seq_len, head_dim / 2]
-     const float *sin_cache, // [max_seq_len, head_dim / 2]
-     const int *pos_ptr, int head_dim, int num_q_heads, int num_k_heads) {
+extern "C" __global__ void rope(
+    __nv_bfloat16 *q, // [num_heads, head_dim]
+    const __nv_bfloat16 *q_bias,
+    __nv_bfloat16 *k, // [num_kv_heads, head_dim]
+    const __nv_bfloat16 *k_bias,
+    const float *cos_cache, // [max_seq_len, head_dim / 2]
+    const float *sin_cache, // [max_seq_len, head_dim / 2]
+    const int *pos_ptr,
+    int head_dim,
+    int num_q_heads,
+    int num_k_heads) {
     int pos_idx = *pos_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 

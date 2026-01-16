@@ -1,9 +1,9 @@
 #include <cub/block/block_reduce.cuh>
 #include <cuda_bf16.h>
 
-extern "C" __global__ void
-softmax_kernel(__nv_bfloat16 *logits, // 输入输出: [num_heads, seq_len]
-               int seq_len) {
+extern "C" __global__ void softmax_kernel(
+    __nv_bfloat16 *logits, // 输入输出: [num_heads, seq_len]
+    int seq_len) {
     // 1. 设置索引
     int head_idx = blockIdx.x;
     int tid = threadIdx.x;

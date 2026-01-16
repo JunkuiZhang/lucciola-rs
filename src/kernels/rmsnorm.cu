@@ -1,10 +1,12 @@
 #include <cub/block/block_reduce.cuh>
 #include <cuda_bf16.h>
 
-extern "C" __global__ void rmsnorm_nvidia(__nv_bfloat16 *out,
-                                          const __nv_bfloat16 *input,
-                                          const __nv_bfloat16 *weight,
-                                          float epsilon, int num_cols) {
+extern "C" __global__ void rmsnorm_nvidia(
+    __nv_bfloat16 *out,
+    const __nv_bfloat16 *input,
+    const __nv_bfloat16 *weight,
+    float epsilon,
+    int num_cols) {
     int row = blockIdx.x;
     float sq_sum = 0.0f;
 

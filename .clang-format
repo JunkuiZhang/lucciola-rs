@@ -1,1 +1,5 @@
 IndentWidth: 4
+BinPackParameters: false
+BinPackArguments: false
+AlignAfterOpenBracket: AlwaysBreak
+# SeparatedDefinitionBlocks: Always

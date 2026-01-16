@@ -1,9 +1,10 @@
 #include <cuda_bf16.h>
 
-extern "C" __global__ void
-batched_embedding_kernel(const __nv_bfloat16 *__restrict__ embedding_table,
-                         const unsigned int *__restrict__ input_ids,
-                         __nv_bfloat16 *__restrict__ output, int hidden_dim) {
+extern "C" __global__ void batched_embedding_kernel(
+    const __nv_bfloat16 *__restrict__ embedding_table,
+    const unsigned int *__restrict__ input_ids,
+    __nv_bfloat16 *__restrict__ output,
+    int hidden_dim) {
     // blockIdx.x corresponds to the token index in the batch/sequence
     int token_idx = blockIdx.x;
     unsigned int token_id = input_ids[token_idx];
