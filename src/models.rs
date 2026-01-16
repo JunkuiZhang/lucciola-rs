@@ -3,9 +3,7 @@ use cudarc::cublas::CudaBlas;
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
 };
-use cudarc::driver::{
-    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
-};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
@@ -456,11 +454,11 @@ impl Qwen2Model {
         // 3. Serial Loop for Attention/RoPE/Cache
         for t in 0..seq_len {
             let current_pos = cache_pos + t;
-            
+
             // For Prefill (seq_len > 1), we must update pos_ptr eagerly.
             // For Decode (seq_len == 1), pos_ptr is updated by caller (to support Graph Capture).
             if seq_len > 1 {
-                 stream.memcpy_htod(&[current_pos as i32], pos_ptr)?;
+                stream.memcpy_htod(&[current_pos as i32], pos_ptr)?;
             }
 
             let row_offset = t * qkv_output_dim;
