@@ -5,12 +5,8 @@ struct KeyValuePair {
     float value;
 };
 
-extern "C" __global__ void bitonic_sort_step(
-    KeyValuePair* items,
-    int j,
-    int k,
-    int n
-) {
+extern "C" __global__ void bitonic_sort_step(KeyValuePair *items, int j, int k,
+                                             int n) {
     unsigned int tid = threadIdx.x + blockDim.x * blockIdx.x;
     unsigned int ixj = tid ^ j;
 
@@ -37,12 +33,9 @@ extern "C" __global__ void bitonic_sort_step(
     }
 }
 
-extern "C" __global__ void init_pairs(
-    KeyValuePair* items,
-    const __nv_bfloat16* logits,
-    int n,
-    int vocab_size
-) {
+extern "C" __global__ void init_pairs(KeyValuePair *items,
+                                      const __nv_bfloat16 *logits, int n,
+                                      int vocab_size) {
     int tid = threadIdx.x + blockDim.x * blockIdx.x;
     if (tid < vocab_size) {
         items[tid].key = tid;

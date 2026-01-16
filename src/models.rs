@@ -375,14 +375,14 @@ impl Qwen2Model {
         let p_threshold = sampler.top_p();
         if p_threshold < 1.0 {
             let rand_val: f32 = rand::rng().random();
-             self.cuda_functions.apply_sort_and_sample(
+            self.cuda_functions.apply_sort_and_sample(
                 &stream,
                 &self.buffers.logits,
                 &mut self.sample_indices_buffer,
                 &mut self.sort_buffer,
                 self.config.vocab_size,
                 p_threshold,
-                rand_val
+                rand_val,
             )?;
             let host_idx = stream.clone_dtoh(&self.sample_indices_buffer)?;
             return Ok(host_idx[0]);

@@ -346,7 +346,7 @@ impl CudaFunctions {
             shared_mem_bytes: 0,
         };
         unsafe {
-             stream
+            stream
                 .launch_builder(&self.scan_sample)
                 .arg(&*sort_buffer)
                 .arg(&n_i32)
