@@ -1,82 +1,97 @@
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 template <int HEAD_DIM>
 __device__ void flash_decoding_impl(
-    __nv_bfloat16 *output,  
-    const __nv_bfloat16 *q, 
-    const __nv_bfloat16 *k_pool, 
-    const __nv_bfloat16 *v_pool, 
-    const int* block_table,     
-    int layer_idx, 
-    int num_q_heads, 
-    int num_kv_heads,
-    int head_dim_rt, 
-    int max_seq_len,
-    int current_pos, 
-    float sm_scale,
-    int block_size,
-    int num_layers) 
-{
+    __nv_bfloat16 *output, const __nv_bfloat16 *q, const __nv_bfloat16 *k_pool,
+    const __nv_bfloat16 *v_pool, const int *block_table, int layer_idx,
+    int num_q_heads, int num_kv_heads, int head_dim_rt, int max_seq_len,
+    int current_pos, float sm_scale, int block_size, int num_layers) {
+    // --- Indexing ---
     int q_head_idx = blockIdx.x;
-    int kv_head_idx = q_head_idx / (num_q_heads / num_kv_heads); 
+    int kv_head_idx = q_head_idx / (num_q_heads / num_kv_heads);
     int tid = threadIdx.x;
     int warp_id = tid / 32;
     int lane_id = tid % 32;
+    int num_warps = blockDim.x / 32;
 
-    float local_m = -1e20f;
-    float local_l = 0.0f;
-    float local_o[HEAD_DIM]; 
-#pragma unroll
-    for (int i = 0; i < HEAD_DIM; ++i) local_o[i] = 0.0f;
-
+    // --- Shared Memory Layout ---
     extern __shared__ char smem[];
-    float* s_q = (float*)smem;
-    int* s_block_table = (int*)(s_q + HEAD_DIM);
+    float *s_q = (float *)smem; // Size: HEAD_DIM
+    // Align to 4 bytes for int*
+    int *s_block_table = (int *)(s_q + HEAD_DIM); // Size: num_blocks
 
     int num_blocks = (current_pos + block_size) / block_size;
 
-    if (tid < HEAD_DIM) {
-        s_q[tid] = __bfloat162float(q[q_head_idx * HEAD_DIM + tid]);
+    // Pointers for Inter-Warp Reduction (placed after block table)
+    // We expect Rust to allocate enough SMEM:
+    // HEAD_DIM*4 + num_blocks*4 + WARPS*HEAD_DIM*4 + WARPS*4 + WARPS*4
+    float *s_reduce_m = (float *)(s_block_table + num_blocks);
+    // Align if num_blocks was odd? int* -> float* address is compatible (4
+    // bytes).
+
+    float *s_reduce_l = s_reduce_m + num_warps;
+    float *s_reduce_o = s_reduce_l + num_warps; // Size: num_warps * HEAD_DIM
+
+    // --- Load Q Phase ---
+    // Warp-cooperative load
+    for (int i = tid; i < HEAD_DIM; i += blockDim.x) {
+        s_q[i] = __bfloat162float(q[q_head_idx * HEAD_DIM + i]);
     }
 
-    // Load block table to shared memory
+    // --- Load Block Table Phase ---
     for (int i = tid; i < num_blocks; i += blockDim.x) {
         s_block_table[i] = block_table[i];
     }
-    
+
     __syncthreads();
 
-    // Strides
-    long long stride_block = (long long)num_layers * num_kv_heads * block_size * HEAD_DIM;
+    // --- Local Accumulators ---
+    float local_m = -1e20f;
+    float local_l = 0.0f;
+    // Distributed Output: Each thread handles specific dimensions
+    // Max HEAD_DIM 128 (approx) => 128 / 32 = 4 elements per thread
+    float local_o[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        local_o[i] = 0.0f;
+
+    // --- Strides ---
+    long long stride_block =
+        (long long)num_layers * num_kv_heads * block_size * HEAD_DIM;
     long long stride_layer = (long long)num_kv_heads * block_size * HEAD_DIM;
-    long long stride_head  = (long long)block_size * HEAD_DIM;
+    long long stride_head = (long long)block_size * HEAD_DIM;
+    long long layer_head_offset = (long long)layer_idx * stride_layer +
+                                  (long long)kv_head_idx * stride_head;
 
-    // Base pointer for this Layer & Head (but dependent on Block P)
-    // Offset_in_block = (layer * stride_layer) + (head * stride_head) + (token * head_dim)
-    long long layer_head_offset = (long long)layer_idx * stride_layer + (long long)kv_head_idx * stride_head;
-
-    for (int t = tid; t <= current_pos; t += blockDim.x) {
-        // Paged Address Calculation
+    // --- Loop Over Tokens (Warp-Strided) ---
+    // Each Warp processes tokens stepping by num_warps
+    for (int t = warp_id; t <= current_pos; t += num_warps) {
         int log_blk = t / block_size;
         int phy_blk = s_block_table[log_blk];
         int tok_off = t % block_size;
 
-        long long final_offset = 
-            (long long)phy_blk * stride_block + 
-            layer_head_offset + 
-            (long long)tok_off * HEAD_DIM;
+        long long final_offset = (long long)phy_blk * stride_block +
+                                 layer_head_offset +
+                                 (long long)tok_off * HEAD_DIM;
 
-        // --- Attention Logic ---
+        // 1. Compute Dot Product for Token t
         float score = 0.0f;
-        
-#pragma unroll
-        for (int i = 0; i < HEAD_DIM; ++i) {
-            float ki = __bfloat162float(k_pool[final_offset + i]);
-            score += s_q[i] * ki;
+
+        // Coalesced Load K and Dot
+        for (int i = lane_id; i < HEAD_DIM; i += 32) {
+            float val_k = __bfloat162float(k_pool[final_offset + i]);
+            score += s_q[i] * val_k;
         }
+
+        // Warp Reduction for Score
+        for (int offset = 16; offset > 0; offset /= 2) {
+            score += __shfl_down_sync(0xffffffff, score, offset);
+        }
+        score = __shfl_sync(0xffffffff, score, 0); // Broadcast scalar score
         score *= sm_scale;
 
+        // 2. Online Softmax Update
         float m_prev = local_m;
         local_m = fmaxf(m_prev, score);
         float exp_m = expf(m_prev - local_m);
@@ -84,101 +99,87 @@ __device__ void flash_decoding_impl(
 
         local_l = local_l * exp_m + exp_s;
 
-#pragma unroll
-        for (int i = 0; i < HEAD_DIM; ++i) {
-            float vi = __bfloat162float(v_pool[final_offset + i]);
-            local_o[i] = local_o[i] * exp_m + vi * exp_s;
+        // 3. Accumulate V (Distributed)
+        int idx_local = 0;
+        for (int i = lane_id; i < HEAD_DIM; i += 32) {
+            float val_v = __bfloat162float(v_pool[final_offset + i]);
+            local_o[idx_local] = local_o[idx_local] * exp_m + val_v * exp_s;
+            idx_local++;
         }
     }
 
-    // Reduction (Same as before)
-    for (int offset = 16; offset > 0; offset /= 2) {
-        float other_m = __shfl_down_sync(0xffffffff, local_m, offset);
-        float other_l = __shfl_down_sync(0xffffffff, local_l, offset);
-
-        float new_m = fmaxf(local_m, other_m);
-        float scale_self = expf(local_m - new_m);
-        float scale_other = expf(other_m - new_m);
-
-        local_m = new_m;
-        local_l = local_l * scale_self + other_l * scale_other;
-
-        for (int i = 0; i < HEAD_DIM; i++) {
-            float val = local_o[i];
-            float other_val = __shfl_down_sync(0xffffffff, val, offset);
-            local_o[i] = val * scale_self + other_val * scale_other;
-        }
-    }
-
-    // Now lane 0 of each warp has the warp-result.
-    // Store to shared memory to let Warp 0 collect them.
-    static __shared__ float s_m[4]; // 128 threads = 4 warps
-    static __shared__ float s_l[4];
-    static __shared__ float s_o[HEAD_DIM][4]; // [dim][warp]
-
+    // --- Inter-Warp Reduction ---
+    // Store local state to Shared Mem
     if (lane_id == 0) {
-        s_m[warp_id] = local_m;
-        s_l[warp_id] = local_l;
-        for (int i = 0; i < HEAD_DIM; ++i)
-            s_o[i][warp_id] = local_o[i];
+        s_reduce_m[warp_id] = local_m;
+        s_reduce_l[warp_id] = local_l;
     }
+
+    // Store distributed O to Shared Mem
+    int idx_local = 0;
+    for (int i = lane_id; i < HEAD_DIM; i += 32) {
+        // Flattened indexing: [warp * Dim + dim]
+        s_reduce_o[warp_id * HEAD_DIM + i] = local_o[idx_local];
+        idx_local++;
+    }
+
     __syncthreads();
 
-    // Warp 0 does final reduction
+    // Warp 0 Aggregates and Writes
     if (warp_id == 0) {
-        // Reload local state from Warp 0's slot
-        local_m = s_m[0];
-        local_l = s_l[0];
-        for (int i = 0; i < HEAD_DIM; ++i)
-            local_o[i] = s_o[i][0];
+        // 1. Compute Global M
+        float global_m = -1e20f;
+        for (int w = 0; w < num_warps; ++w) {
+            global_m = fmaxf(global_m, s_reduce_m[w]);
+        }
 
-        // Merge Warp 1, 2, 3
-        for (int w = 1; w < 4; ++w) { // Assuming 128 threads -> 4 warps
-            float other_m = s_m[w];
-            float other_l = s_l[w];
-            float new_m = fmaxf(local_m, other_m);
-            float scale_self = expf(local_m - new_m);
-            float scale_other = expf(other_m - new_m);
+        // 2. Compute Global L
+        float global_l = 0.0f;
+        for (int w = 0; w < num_warps; ++w) {
+            float diff = s_reduce_m[w] - global_m;
+            // Prevent underflow/NaN for unused warps (init -1e20)
+            if (s_reduce_m[w] <= -1e19f)
+                continue;
+            global_l += s_reduce_l[w] * expf(diff);
+        }
 
-            local_m = new_m;
-            local_l = local_l * scale_self + other_l * scale_other;
+        // 3. Aggregate O and Write
+        // Each thread in Warp 0 handles specific dimensions `i`
+        for (int i = lane_id; i < HEAD_DIM; i += 32) {
+            float sum_o = 0.0f;
+            for (int w = 0; w < num_warps; ++w) {
+                if (s_reduce_m[w] <= -1e19f)
+                    continue;
 
-            for (int i = 0; i < HEAD_DIM; ++i) {
-                local_o[i] = local_o[i] * scale_self + s_o[i][w] * scale_other;
+                float val = s_reduce_o[w * HEAD_DIM + i];
+                float scale = expf(s_reduce_m[w] - global_m);
+                sum_o += val * scale;
             }
+            // Normalize
+            sum_o /= global_l;
+
+            // Global Write (Coalesced)
+            output[q_head_idx * HEAD_DIM + i] = __float2bfloat16(sum_o);
         }
-
-        // Final normalization: O = O / L
-        for (int i = 0; i < HEAD_DIM; ++i) {
-            local_o[i] /= local_l;
-        }
-
-        // 5. Write to Global Memory
-        for (int i = 0; i < HEAD_DIM; ++i)
-            s_q[i] = local_o[i]; 
-    }
-
-    __syncthreads();
-
-    if (tid < HEAD_DIM) {
-        output[q_head_idx * HEAD_DIM + tid] = __float2bfloat16(s_q[tid]);
     }
 }
 
 extern "C" __global__ void flash_decoding_kernel_64(
     __nv_bfloat16 *output, const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-    const __nv_bfloat16 *v, const int* block_table,
-    int layer_idx, int num_q_heads, int num_kv_heads,
-    int head_dim, int max_seq_len, int current_pos, float sm_scale, int block_size, int num_layers) {
-    flash_decoding_impl<64>(output, q, k, v, block_table, layer_idx, num_q_heads, num_kv_heads,
-                            head_dim, max_seq_len, current_pos, sm_scale, block_size, num_layers);
+    const __nv_bfloat16 *v, const int *block_table, int layer_idx,
+    int num_q_heads, int num_kv_heads, int head_dim, int max_seq_len,
+    int current_pos, float sm_scale, int block_size, int num_layers) {
+    flash_decoding_impl<64>(output, q, k, v, block_table, layer_idx,
+                            num_q_heads, num_kv_heads, head_dim, max_seq_len,
+                            current_pos, sm_scale, block_size, num_layers);
 }
 
 extern "C" __global__ void flash_decoding_kernel_128(
     __nv_bfloat16 *output, const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-    const __nv_bfloat16 *v, const int* block_table,
-    int layer_idx, int num_q_heads, int num_kv_heads,
-    int head_dim, int max_seq_len, int current_pos, float sm_scale, int block_size, int num_layers) {
-    flash_decoding_impl<128>(output, q, k, v, block_table, layer_idx, num_q_heads, num_kv_heads,
-                             head_dim, max_seq_len, current_pos, sm_scale, block_size, num_layers);
+    const __nv_bfloat16 *v, const int *block_table, int layer_idx,
+    int num_q_heads, int num_kv_heads, int head_dim, int max_seq_len,
+    int current_pos, float sm_scale, int block_size, int num_layers) {
+    flash_decoding_impl<128>(output, q, k, v, block_table, layer_idx,
+                             num_q_heads, num_kv_heads, head_dim, max_seq_len,
+                             current_pos, sm_scale, block_size, num_layers);
 }
