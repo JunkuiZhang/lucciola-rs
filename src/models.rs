@@ -134,10 +134,11 @@ impl Qwen2Model {
         let buffers = InferenceBuffers::new(&stream, &config)?;
         let sample_indices_buffer = stream.alloc_zeros::<u32>(1)?;
 
-        let vocab_size = config.vocab_size;
-        let n: u32 = 1u32 << (32 - (vocab_size as u32 - 1).leading_zeros());
-        // KeyValuePair is {int, float} = 8 bytes
-        let sort_buffer = stream.alloc_zeros::<u8>(n as usize * 8)?;
+        let _vocab_size = config.vocab_size;
+        // Optimization: sort_buffer doesn't need to be full Vocab size anymore.
+        // It only needs to hold 1024 KeyValuePairs (8KB).
+        // Let's alloc 1024 * 8 bytes = 8192 bytes.
+        let sort_buffer = stream.alloc_zeros::<u8>(1024 * 8)?;
 
         Ok(Qwen2Model {
             device,
