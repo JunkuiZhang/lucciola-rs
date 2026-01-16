@@ -41,6 +41,7 @@ pub struct Qwen2Model {
     cuda_functions: CudaFunctions,
     pub config: ModelConfig,
     pub sample_indices_buffer: CudaSlice<u32>,
+    pub sort_buffer: CudaSlice<u8>, // Temporary buffer for sort
 }
 
 impl Qwen2Model {
@@ -133,6 +134,11 @@ impl Qwen2Model {
         let buffers = InferenceBuffers::new(&stream, &config)?;
         let sample_indices_buffer = stream.alloc_zeros::<u32>(1)?;
 
+        let vocab_size = config.vocab_size;
+        let n: u32 = 1u32 << (32 - (vocab_size as u32 - 1).leading_zeros());
+        // KeyValuePair is {int, float} = 8 bytes
+        let sort_buffer = stream.alloc_zeros::<u8>(n as usize * 8)?;
+
         Ok(Qwen2Model {
             device,
             blas,
@@ -146,6 +152,7 @@ impl Qwen2Model {
             cuda_functions,
             config,
             sample_indices_buffer,
+            sort_buffer,
         })
     }
     pub fn generate(
@@ -362,6 +369,26 @@ impl Qwen2Model {
             return Ok(host_idx[0]);
         }
 
+        // Top-P GPU Path
+        // We use a random float for sampling
+        use rand::Rng;
+        let p_threshold = sampler.top_p();
+        if p_threshold < 1.0 {
+            let rand_val: f32 = rand::rng().random();
+             self.cuda_functions.apply_sort_and_sample(
+                &stream,
+                &self.buffers.logits,
+                &mut self.sample_indices_buffer,
+                &mut self.sort_buffer,
+                self.config.vocab_size,
+                p_threshold,
+                rand_val
+            )?;
+            let host_idx = stream.clone_dtoh(&self.sample_indices_buffer)?;
+            return Ok(host_idx[0]);
+        }
+
+        // Fallback to CPU for other cases (Temp only or debug)
         let host_data = stream.clone_dtoh(&self.buffers.logits)?;
         let mut logits: Vec<f32> = host_data.into_iter().map(|x: bf16| x.to_f32()).collect();
         sampler.sample(&mut logits)

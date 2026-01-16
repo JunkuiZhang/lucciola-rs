@@ -9,6 +9,8 @@ fn main() {
     println!("cargo:rerun-if-changed={project_dir}/src/kernels/rope.cu");
     println!("cargo:rerun-if-changed={project_dir}/src/kernels/embedding.cu");
     println!("cargo:rerun-if-changed={project_dir}/src/kernels/sampling.cu");
+    println!("cargo:rerun-if-changed={project_dir}/src/kernels/sort.cu");
+    println!("cargo:rerun-if-changed={project_dir}/src/kernels/scan_sample.cu");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dst_path = std::path::Path::new(&out_dir);
@@ -20,6 +22,8 @@ fn main() {
         "rmsnorm.cu",
         "rope.cu",
         "sampling.cu",
+        "sort.cu",
+        "scan_sample.cu",
     ];
     for kernel in kernels {
         let ptx_path = dst_path.join(format!("{kernel}.ptx"));

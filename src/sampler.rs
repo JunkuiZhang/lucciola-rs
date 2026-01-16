@@ -27,6 +27,10 @@ impl Sampler {
         self.temperature == 0.0
     }
 
+    pub fn top_p(&self) -> f32 {
+        self.top_p
+    }
+
     pub fn sample(&mut self, logits: &mut [f32]) -> Result<u32> {
         // 1. Apply Temperature
         if self.temperature == 0.0 {

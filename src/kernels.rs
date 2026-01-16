@@ -19,6 +19,9 @@ pub struct CudaFunctions {
     pub(crate) rmsnorm: CudaFunction,
     pub(crate) rope: CudaFunction,
     pub(crate) sampling: CudaFunction,
+    pub(crate) sort_init: CudaFunction,
+    pub(crate) sort_step: CudaFunction,
+    pub(crate) scan_sample: CudaFunction,
 }
 
 impl CudaFunctions {
@@ -47,6 +50,11 @@ impl CudaFunctions {
         let rope = load_cuda_funtion(context, ptx::ROPE_PTX, "rope")?;
         println!("Loading sampling kernel...");
         let sampling = load_cuda_funtion(context, ptx::SAMPLING_PTX, "argmax_kernel")?;
+        println!("Loading sort kernels...");
+        let sort_init = load_cuda_funtion(context, ptx::SORT_PTX, "init_pairs")?;
+        let sort_step = load_cuda_funtion(context, ptx::SORT_PTX, "bitonic_sort_step")?;
+        let scan_sample = load_cuda_funtion(context, ptx::SCAN_SAMPLE_PTX, "top_p_scan_sample")?;
+
         println!("Loading formatted kernels done.");
 
         Ok(Self {
@@ -56,6 +64,9 @@ impl CudaFunctions {
             rmsnorm,
             rope,
             sampling,
+            sort_init,
+            sort_step,
+            scan_sample,
         })
     }
 
@@ -283,6 +294,68 @@ impl CudaFunctions {
                 .arg(output_idx)
                 .launch(cfg)?;
         };
+        Ok(())
+    }
+
+    pub fn apply_sort_and_sample(
+        &self,
+        stream: &CudaStream,
+        logits: &CudaSlice<bf16>,
+        output_idx: &mut CudaSlice<u32>,
+        sort_buffer: &mut CudaSlice<u8>,
+        vocab_size: usize,
+        top_p: f32,
+        rand_val: f32,
+    ) -> Result<()> {
+        let n: u32 = 1u32 << (32 - (vocab_size as u32 - 1).leading_zeros());
+        let n_i32 = n as i32;
+        let vocab_size_i32 = vocab_size as i32;
+
+        let cfg_init = LaunchConfig::for_num_elems(n);
+        unsafe {
+            stream
+                .launch_builder(&self.sort_init)
+                .arg(&*sort_buffer)
+                .arg(logits)
+                .arg(&n_i32)
+                .arg(&vocab_size_i32)
+                .launch(cfg_init)?;
+        }
+
+        let mut k = 2;
+        while k <= n {
+            let mut j = k / 2;
+            while j > 0 {
+                unsafe {
+                    stream
+                        .launch_builder(&self.sort_step)
+                        .arg(&*sort_buffer)
+                        .arg(&(j as i32))
+                        .arg(&(k as i32))
+                        .arg(&n_i32)
+                        .launch(cfg_init)?;
+                }
+                j /= 2;
+            }
+            k *= 2;
+        }
+
+        let cfg_scan = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+             stream
+                .launch_builder(&self.scan_sample)
+                .arg(&*sort_buffer)
+                .arg(&n_i32)
+                .arg(&top_p)
+                .arg(&rand_val)
+                .arg(output_idx)
+                .launch(cfg_scan)?;
+        }
+
         Ok(())
     }
 }

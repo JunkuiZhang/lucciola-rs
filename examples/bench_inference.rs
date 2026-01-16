@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     model.forward(input_ids, cache_pos)?;
     cache_pos += n_input;
 
-    let _logits = model.compute_logits()?;
+    model.compute_logits()?;
 
     stream.synchronize()?;
     let prefill_duration = start_prefill.elapsed();
@@ -50,8 +50,8 @@ fn main() -> Result<()> {
     println!("Time to First Token (TTFT): {:.2} ms", ttft_ms);
 
     // --- Benchmarking Generation ---
-    println!("Benchmarking Generation (50 tokens)...");
     let n_gen = 200;
+    println!("Benchmarking Generation ({n_gen} tokens)...");
 
     // Get last token from input to start generation (though we verify sample next)
     // Actually we pick the token from the sample() result usually, but here for simple bench

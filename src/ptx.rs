@@ -17,3 +17,8 @@ pub(crate) static ROPE_PTX: &'static str = include_str!(concat!(env!("OUT_DIR"),
 
 pub(crate) static SAMPLING_PTX: &'static str =
     include_str!(concat!(env!("OUT_DIR"), "/sampling.cu.ptx"));
+
+pub(crate) static SORT_PTX: &'static str = include_str!(concat!(env!("OUT_DIR"), "/sort.cu.ptx"));
+
+pub(crate) static SCAN_SAMPLE_PTX: &'static str =
+    include_str!(concat!(env!("OUT_DIR"), "/scan_sample.cu.ptx"));
