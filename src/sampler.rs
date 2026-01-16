@@ -15,6 +15,7 @@ impl Sampler {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_os_rng(),
         };
+        let top_k = if top_k == 0 { 1024 } else { top_k };
         Self {
             rng,
             temperature,

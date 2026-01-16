@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     let mut model = Qwen2Model::load(0, model_path)?;
     println!("Model loaded.");
 
-    let mut sampler = Sampler::new(None, 0.0, 0.9, 50);
+    let mut sampler = Sampler::new(None, 0.8, 0.9, 0);
 
     // 3. Prepare Input
     let prompt = "To be, or not to be, that is the question: Whether 'tis nobler in the mind to suffer The slings and arrows of outrageous fortune, Or to take arms against a sea of troubles And by opposing end them.";
