@@ -18,7 +18,7 @@ use crate::layers::rope::RopeCache;
 use crate::layers::weights::LayerWeights;
 use crate::sampler::Sampler;
 use crate::streamer::Streamer;
-use crate::utils::{concat_tensors, get_tensor};
+use crate::utils::{concat_tensors, concat_tensors_or_zeros, get_tensor};
 
 struct ForwardPassBuffers<'a> {
     pub hidden_states: &'a mut CudaSlice<bf16>,
@@ -66,6 +66,9 @@ impl Qwen2Model {
             get_tensor(&stream, &tensors, "lm_head.weight")?
         };
 
+        let head_dim = config.hidden_size / config.num_attention_heads;
+        let bias_dim = config.hidden_size + 2 * config.num_key_value_heads * head_dim;
+
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             let layer_prefix = format!("model.layers.{}.", layer_idx);
@@ -84,7 +87,7 @@ impl Qwen2Model {
                         format!("{}self_attn.v_proj.weight", layer_prefix),
                     ],
                 )?,
-                qkv_bias: concat_tensors(
+                qkv_bias: concat_tensors_or_zeros(
                     &stream,
                     &tensors,
                     &[
@@ -92,6 +95,7 @@ impl Qwen2Model {
                         format!("{}self_attn.k_proj.bias", layer_prefix),
                         format!("{}self_attn.v_proj.bias", layer_prefix),
                     ],
+                    bias_dim,
                 )?,
                 o_proj: get_tensor(
                     &stream,
@@ -121,13 +125,12 @@ impl Qwen2Model {
         }
         let final_norm = get_tensor(&stream, &tensors, "model.norm.weight")?;
 
-        // Qwen2.5 head_dim = hidden_size / num_attention_heads
-        let head_dim = config.hidden_size / config.num_attention_heads;
         let rope = RopeCache::new(
             &stream,
             config.max_position_embeddings,
             head_dim,
             config.rope_theta,
+            config.rope_scaling.as_ref().map(|s| s.factor),
         )?;
         // Initialize KV Cache (using 80% of remaining free VRAM)
         let kv_cache = KVCache::new(&device, &stream, &config, 0.8)?;

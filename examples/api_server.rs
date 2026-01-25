@@ -129,7 +129,8 @@ struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Check if models exist
-    let model_path = "/app/lucciola/models/Qwen2.5-0.5B-Instruct";
+    // let model_path = "/app/lucciola/models/Qwen2.5-0.5B-Instruct";
+    let model_path = "/app/lucciola/models/deepseek-coder-1.3b-base";
     if !std::path::Path::new(model_path).exists() {
         anyhow::bail!("Model not found at {}. Please download it first.", model_path);
     }

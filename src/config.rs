@@ -18,6 +18,14 @@ pub struct ModelConfig {
     pub eos_token_id: u32,
     pub bos_token_id: u32,
     pub tie_word_embeddings: bool,
+    pub rope_scaling: Option<RopeScaling>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RopeScaling {
+    pub factor: f32,
+    #[serde(rename = "type")]
+    pub type_: String,
 }
 
 fn default_rope_theta() -> f32 {
