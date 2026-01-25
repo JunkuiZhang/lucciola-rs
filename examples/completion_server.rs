@@ -85,8 +85,8 @@ async fn main() -> anyhow::Result<()> {
     // let model_path = possible_paths.iter()
     //     .find(|p| std::path::Path::new(p).exists())
     //     .ok_or_else(|| anyhow::anyhow!("No model found. Please download deepseek-coder-1.3b-base."))?;
-    // let model_path = "/app/lucciola/models/deepseek-coder-1.3b-base";
-    let model_path = "/app/lucciola/models/deepseek-coder-6.7b-base";
+    let model_path = "/app/lucciola/models/deepseek-coder-1.3b-base";
+    // let model_path = "/app/lucciola/models/deepseek-coder-6.7b-base";
 
     // println!("Loading model from {}...", model_path);
     println!("Loading model...");
@@ -298,11 +298,11 @@ async fn completions_handler(
             let mut model = state_model.model.lock().unwrap();
             let mut sampler = Sampler::new(
                 None,
-                request.temperature.unwrap_or(0.1), // Coder usually low temp
+                request.temperature.unwrap_or(0.0), // Coder usually low temp
                 request.top_p.unwrap_or(0.95),
                 1024,
             );
-            let max_tokens = request.max_tokens.unwrap_or(128); // Default small for completion
+            let max_tokens = request.max_tokens.unwrap_or(1024); // Default small for completion
 
             let mut current_text = String::new();
 
