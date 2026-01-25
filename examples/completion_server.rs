@@ -1,17 +1,17 @@
-use tower_http::cors::{CorsLayer, Any};
-use axum::{
-    extract::State,
-    routing::post,
-    Json, Router,
-    response::{IntoResponse, Sse},
-};
 use axum::response::sse::Event;
+use axum::{
+    Json, Router,
+    extract::State,
+    response::{IntoResponse, Sse},
+    routing::post,
+};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tower_http::cors::{Any, CorsLayer};
 
 use lucciola::models::Qwen2Model; // Logic is compatible with DeepSeek if loaded correctly
 use lucciola::sampler::Sampler;
@@ -85,13 +85,15 @@ async fn main() -> anyhow::Result<()> {
     // let model_path = possible_paths.iter()
     //     .find(|p| std::path::Path::new(p).exists())
     //     .ok_or_else(|| anyhow::anyhow!("No model found. Please download deepseek-coder-1.3b-base."))?;
-    let model_path = "/app/lucciola/models/deepseek-coder-1.3b-base";
-    
-    println!("Loading model from {}...", model_path);
+    // let model_path = "/app/lucciola/models/deepseek-coder-1.3b-base";
+    let model_path = "/app/lucciola/models/deepseek-coder-6.7b-base";
+
+    // println!("Loading model from {}...", model_path);
+    println!("Loading model...");
     let model = Qwen2Model::load(0, model_path)?;
     let tokenizer = tokenizers::Tokenizer::from_file(format!("{}/tokenizer.json", model_path))
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-    
+
     // Look up FIM tokens
     let fim_begin = tokenizer.token_to_id("<｜fim▁begin｜>");
     let fim_hole = tokenizer.token_to_id("<｜fim▁hole｜>");
@@ -127,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     let address_str = "0.0.0.0:3000";
     let addr: SocketAddr = address_str.parse()?;
     println!("Listening on http://{}", address_str);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
@@ -140,15 +142,19 @@ async fn completions_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
-    println!("Request: FIM={:?} Stream={:?}", request.suffix.is_some(), request.stream);
+    println!(
+        "Request: FIM={:?} Stream={:?}",
+        request.suffix.is_some(),
+        request.stream
+    );
 
     // 1. Construct Input IDs
     // Case A: FIM (Prompt + Suffix)
     // Case B: Normal (Prompt only)
-    
+
     let mut input_ids = Vec::new();
-    
-    // 0. Add BOS (Beginning of Sequence) if available. 
+
+    // 0. Add BOS (Beginning of Sequence) if available.
     // DeepSeek/Llama models perform better with explicit BOS.
     // DeepSeek-Coder config usually has bos_token_id = 32013.
     let bos_id = {
@@ -159,87 +165,124 @@ async fn completions_handler(
 
     if let Some(suffix) = &request.suffix {
         // FIM Mode: <begin> PROMPT <hole> SUFFIX <end>
-        if let (Some(b), Some(h), Some(e)) = (state.fim_begin_id, state.fim_hole_id, state.fim_end_id) {
+        if let (Some(b), Some(h), Some(e)) =
+            (state.fim_begin_id, state.fim_hole_id, state.fim_end_id)
+        {
             input_ids.push(b);
-            let prompt_ids = state.tokenizer.encode(request.prompt.clone(), false).unwrap();
+            let prompt_ids = state
+                .tokenizer
+                .encode(request.prompt.clone(), false)
+                .unwrap();
             input_ids.extend(prompt_ids.get_ids());
-            
+
             input_ids.push(h);
             let suffix_ids = state.tokenizer.encode(suffix.clone(), false).unwrap();
             input_ids.extend(suffix_ids.get_ids());
-            
+
             input_ids.push(e);
         } else {
             // Fallback: Just concatenate? Or fail? Better to just use prompt.
             eprintln!("FIM requested but tokens missing. Falling back to prefix-only.");
-            let ids = state.tokenizer.encode(request.prompt.clone(), false).unwrap();
+            let ids = state
+                .tokenizer
+                .encode(request.prompt.clone(), false)
+                .unwrap();
             input_ids.extend(ids.get_ids());
         }
     } else {
         // Normal Mode or Client-Formatted FIM
         // Check if the prompt contains StarCoder/CodeLlama style text markers
         // Format: <fim_prefix> PREFIX <fim_suffix> SUFFIX <fim_middle>
-        if request.prompt.contains("<fim_prefix>") && request.prompt.contains("<fim_suffix>") && request.prompt.contains("<fim_middle>") {
+        if request.prompt.contains("<fim_prefix>")
+            && request.prompt.contains("<fim_suffix>")
+            && request.prompt.contains("<fim_middle>")
+        {
             // Detected client-side FIM formatting
             println!("DEBUG: Detected client-side FIM markers in prompt string.");
-            if let (Some(b), Some(h), Some(e)) = (state.fim_begin_id, state.fim_hole_id, state.fim_end_id) {
-               // Extract valid parts
-               // String looks like: "<fim_prefix>...<fim_suffix>...<fim_middle>"
-               // We split by <fim_suffix> first
-               let parts: Vec<&str> = request.prompt.split("<fim_suffix>").collect();
-               if parts.len() >= 2 {
-                   // Part 0 contains <fim_prefix> and the actual prefix
-                   let raw_prefix = parts[0]; 
-                   // Part 1 contains the actual suffix and <fim_middle>
-                   let raw_suffix = parts[1];
+            if let (Some(b), Some(h), Some(e)) =
+                (state.fim_begin_id, state.fim_hole_id, state.fim_end_id)
+            {
+                // Extract valid parts
+                // String looks like: "<fim_prefix>...<fim_suffix>...<fim_middle>"
+                // We split by <fim_suffix> first
+                let parts: Vec<&str> = request.prompt.split("<fim_suffix>").collect();
+                if parts.len() >= 2 {
+                    // Part 0 contains <fim_prefix> and the actual prefix
+                    let raw_prefix = parts[0];
+                    // Part 1 contains the actual suffix and <fim_middle>
+                    let raw_suffix = parts[1];
 
-                   let prefix = raw_prefix.replace("<fim_prefix>", "");
-                   let suffix = raw_suffix.replace("<fim_middle>", "");
+                    let prefix = raw_prefix.replace("<fim_prefix>", "");
+                    let suffix = raw_suffix.replace("<fim_middle>", "");
 
-                   // 1. Begin
-                   input_ids.push(b);
-                   // 2. Prefix
-                   input_ids.extend(state.tokenizer.encode(prefix, false).unwrap().get_ids());
-                   // 3. Hole
-                   input_ids.push(h);
-                   // 4. Suffix
-                   input_ids.extend(state.tokenizer.encode(suffix, false).unwrap().get_ids());
-                   // 5. End
-                   input_ids.push(e);
-
-               } else {
-                   // Malformed split
-                    let ids = state.tokenizer.encode(request.prompt.clone(), false).unwrap();
+                    // 1. Begin
+                    input_ids.push(b);
+                    // 2. Prefix
+                    input_ids.extend(state.tokenizer.encode(prefix, false).unwrap().get_ids());
+                    // 3. Hole
+                    input_ids.push(h);
+                    // 4. Suffix
+                    input_ids.extend(state.tokenizer.encode(suffix, false).unwrap().get_ids());
+                    // 5. End
+                    input_ids.push(e);
+                } else {
+                    // Malformed split
+                    let ids = state
+                        .tokenizer
+                        .encode(request.prompt.clone(), false)
+                        .unwrap();
                     input_ids.extend(ids.get_ids());
-               }
+                }
             } else {
-                let ids = state.tokenizer.encode(request.prompt.clone(), false).unwrap();
+                let ids = state
+                    .tokenizer
+                    .encode(request.prompt.clone(), false)
+                    .unwrap();
                 input_ids.extend(ids.get_ids());
             }
         } else {
             // Truly Normal Mode
             // We manually added BOS above, so encode with false to avoid double BOS
-            let ids = state.tokenizer.encode(request.prompt.clone(), false).unwrap();
+            let ids = state
+                .tokenizer
+                .encode(request.prompt.clone(), false)
+                .unwrap();
             input_ids.extend(ids.get_ids());
         }
     }
 
-    println!("Request: FIM={} Stream={:?} InputLen={} First10={:?}", 
-        request.suffix.is_some(), 
-        request.stream, 
-        input_ids.len(), 
+    println!(
+        "Request: FIM={} Stream={:?} InputLen={} First10={:?}",
+        request.suffix.is_some(),
+        request.stream,
+        input_ids.len(),
         input_ids.iter().take(10).collect::<Vec<_>>()
     );
 
-    println!("DEBUG INPUT Prompt: {:?}, Suffix: {:?}", request.prompt, request.suffix);
-    let decoded_input = state.tokenizer.decode(&input_ids, false).unwrap_or_default();
+    println!(
+        "DEBUG INPUT Prompt: {:?}, Suffix: {:?}",
+        request.prompt, request.suffix
+    );
+    let decoded_input = state
+        .tokenizer
+        .decode(&input_ids, false)
+        .unwrap_or_default();
     println!("DEBUG FULL INPUT DECODED: {:?}", decoded_input);
 
     let is_stream = request.stream.unwrap_or(false);
     let model_name = state.model_name.clone();
-    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let id = format!("cmpl-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
-    
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = format!(
+        "cmpl-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
     // Stop sequences handling
     let stop_sequences = request.stop.clone().unwrap_or_default();
 
@@ -248,17 +291,19 @@ async fn completions_handler(
         let state_model = state.clone();
 
         tokio::task::spawn_blocking(move || {
-            if input_ids.is_empty() { return; }
+            if input_ids.is_empty() {
+                return;
+            }
 
             let mut model = state_model.model.lock().unwrap();
             let mut sampler = Sampler::new(
-                None, 
+                None,
                 request.temperature.unwrap_or(0.1), // Coder usually low temp
-                request.top_p.unwrap_or(0.95), 
-                1024
+                request.top_p.unwrap_or(0.95),
+                1024,
             );
             let max_tokens = request.max_tokens.unwrap_or(128); // Default small for completion
-            
+
             let mut current_text = String::new();
 
             let _ = model.generate(
@@ -274,9 +319,9 @@ async fn completions_handler(
                         if current_text.contains(stop_seq) {
                             // If we hit a stop sequence, we shouldn't send the full token if it contains the stop seq part.
                             // But for simplicity in this stream, we just stop *after* sending.
-                            // Better: check if `token` completes a stop seq. 
+                            // Better: check if `token` completes a stop seq.
                             // This naive check might send the stop token. That's acceptable for now.
-                            return false; 
+                            return false;
                         }
                     }
 
@@ -291,34 +336,37 @@ async fn completions_handler(
                             finish_reason: None,
                         }],
                     };
-                    
+
                     if let Ok(_) = tx.send(Ok(Event::default().json_data(chunk).unwrap())) {
-                        true 
+                        true
                     } else {
-                        false 
+                        false
                     }
-                }
+                },
             );
 
             // Finish
             println!("DEBUG GENERATED TEXT: {:?}", current_text);
-            let _ = tx.send(Ok(Event::default().json_data(CompletionChunk {
-                id: id.clone(),
-                object: "text_completion".to_string(),
-                created,
-                model: model_name.clone(),
-                choices: vec![CompletionChunkChoice {
-                    text: "".to_string(),
-                    index: 0,
-                    finish_reason: Some("stop".to_string()),
-                }],
-            }).unwrap()));
+            let _ = tx.send(Ok(Event::default()
+                .json_data(CompletionChunk {
+                    id: id.clone(),
+                    object: "text_completion".to_string(),
+                    created,
+                    model: model_name.clone(),
+                    choices: vec![CompletionChunkChoice {
+                        text: "".to_string(),
+                        index: 0,
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                })
+                .unwrap()));
             let _ = tx.send(Ok(Event::default().data("[DONE]")));
         });
 
         let stream = UnboundedReceiverStream::new(rx);
-        Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response()
-
+        Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response()
     } else {
         // Non-streaming
         let generated_text = if !input_ids.is_empty() {
@@ -327,12 +375,12 @@ async fn completions_handler(
                 let mut model = state_model.model.lock().unwrap();
                 let mut text_buffer = String::new();
                 let mut sampler = Sampler::new(
-                    None, 
+                    None,
                     request.temperature.unwrap_or(0.1),
-                    request.top_p.unwrap_or(0.95), 
-                    1024
+                    request.top_p.unwrap_or(0.95),
+                    1024,
                 );
-                
+
                 let _ = model.generate(
                     &input_ids,
                     &mut sampler,
@@ -346,14 +394,16 @@ async fn completions_handler(
                                 if let Some(idx) = text_buffer.find(stop_seq) {
                                     text_buffer.truncate(idx);
                                 }
-                                return false; 
+                                return false;
                             }
                         }
-                        true 
-                    }
+                        true
+                    },
                 );
                 text_buffer
-            }).await.unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default()
         } else {
             String::new()
         };
@@ -368,6 +418,7 @@ async fn completions_handler(
                 index: 0,
                 finish_reason: "stop".to_string(),
             }],
-        }).into_response()
+        })
+        .into_response()
     }
 }

@@ -38,7 +38,13 @@ impl KVCache {
         let used = total - free;
         let available_total = (total as f32 * memory_fraction) as usize;
         let Some(allocatable_bytes) = available_total.checked_sub(used) else {
-            anyhow::bail!("Not enough available GPU memory for KV Cache allocation");
+            anyhow::bail!(
+                "Not enough available GPU memory for KV Cache allocation, free: {} GB, used: {} GB, total: {} GB, requested fraction: {}",
+                free as f32 / 1024.0 / 1024.0 / 1024.0,
+                used as f32 / 1024.0 / 1024.0 / 1024.0,
+                total as f32 / 1024.0 / 1024.0 / 1024.0,
+                memory_fraction
+            );
         };
 
         let bytes_per_block = 2

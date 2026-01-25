@@ -1,4 +1,3 @@
-use anyhow::Context;
 use anyhow::Result;
 use cudarc::{
     driver::{CudaContext, CudaFunction, CudaStream},
@@ -20,47 +19,57 @@ pub(crate) fn load_cuda_funtion(
 
 pub(crate) fn get_tensor(
     stream: &Arc<CudaStream>,
-    tensors: &SafeTensors,
+    tensors_list: &[SafeTensors],
     name: &str,
 ) -> Result<cudarc::driver::CudaSlice<bf16>> {
-    let view = tensors
-        .tensor(name)
-        .with_context(|| format!("Tensor {} not found", name))?;
-    let data = view.data();
-    let bf16_data: &[bf16] =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2) };
-    Ok(stream.clone_htod(bf16_data)?)
+    for tensors in tensors_list {
+        if let Ok(view) = tensors.tensor(name) {
+            let data = view.data();
+            let bf16_data: &[bf16] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2) };
+            return Ok(stream.clone_htod(bf16_data)?);
+        }
+    }
+    anyhow::bail!("Tensor {} not found", name)
 }
 
 pub(crate) fn concat_tensors(
     stream: &Arc<CudaStream>,
-    tensors: &SafeTensors,
+    tensors_list: &[SafeTensors],
     names: &[String],
 ) -> Result<cudarc::driver::CudaSlice<bf16>> {
     let mut total_len = 0;
     let mut slices = Vec::with_capacity(names.len());
 
     for name in names {
-        let view = tensors
-            .tensor(name)
-            .with_context(|| format!("Tensor {} not found", name))?;
-        let data = view.data();
-        let bf16_data: &[bf16] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2) };
-        slices.push(bf16_data);
-        total_len += bf16_data.len();
+        let mut found = false;
+        for tensors in tensors_list {
+            if let Ok(view) = tensors.tensor(name) {
+                let data = view.data();
+                let bf16_data: &[bf16] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2)
+                };
+                slices.push(bf16_data);
+                total_len += bf16_data.len();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            anyhow::bail!("Tensor {} not found", name);
+        }
     }
 
     let mut combined = Vec::with_capacity(total_len);
     for slice in slices {
         combined.extend_from_slice(slice);
     }
-    
+
     Ok(stream.clone_htod(&combined)?)
 }
 pub(crate) fn concat_tensors_or_zeros(
     stream: &Arc<CudaStream>,
-    tensors: &SafeTensors,
+    tensors_list: &[SafeTensors],
     names: &[String],
     expected_len: usize,
 ) -> Result<cudarc::driver::CudaSlice<bf16>> {
@@ -69,13 +78,21 @@ pub(crate) fn concat_tensors_or_zeros(
     let mut all_found = true;
 
     for name in names {
-        if let Ok(view) = tensors.tensor(name) {
-             let data = view.data();
-             let bf16_data: &[bf16] =
-                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2) };
-             slices.push(Some(bf16_data));
-             total_len += bf16_data.len();
-        } else {
+        let mut found = false;
+        for tensors in tensors_list {
+            if let Ok(view) = tensors.tensor(name) {
+                let data = view.data();
+                let bf16_data: &[bf16] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2)
+                };
+                slices.push(Some(bf16_data));
+                total_len += bf16_data.len();
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
             all_found = false;
             slices.push(None); // Placeholder
         }
@@ -84,10 +101,10 @@ pub(crate) fn concat_tensors_or_zeros(
     if !all_found {
         // If not all bias tensors are found, return zeros.
         // We assume either ALL are present or NONE are present for simplicity (or at least robust enough)
-        // But what if only some are present? 
+        // But what if only some are present?
         // For Llama/DeepSeek, usually NO bias is present in QKV Proj.
         // So we just return a zero buffer of expected length.
-        
+
         let zeros = vec![bf16::from_f32(0.0); expected_len];
         return Ok(stream.clone_htod(&zeros)?);
     }
@@ -98,7 +115,7 @@ pub(crate) fn concat_tensors_or_zeros(
             combined.extend_from_slice(s);
         }
     }
-    
+
     // Safety check?
     if combined.len() != expected_len {
         // If we found tensors but length mismatch?

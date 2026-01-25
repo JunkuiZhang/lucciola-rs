@@ -56,14 +56,42 @@ impl Qwen2Model {
         let config: ModelConfig = serde_json::from_reader(std::fs::File::open(config_file)?)?;
         println!("Model Config: {:#?}", config);
 
-        let tensors_file = File::open(path.as_ref().join("model.safetensors"))?;
-        let mmap = unsafe { MmapOptions::new().map(&tensors_file)? };
-        let tensors = SafeTensors::deserialize(&mmap)?;
-        let embed_tokens = get_tensor(&stream, &tensors, "model.embed_tokens.weight")?;
+        // Load all .safetensors files
+        let mut file_paths = Vec::new();
+        let read_dir = std::fs::read_dir(&path)?;
+        for entry in read_dir {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "safetensors") {
+                file_paths.push(path);
+            }
+        }
+        file_paths.sort(); // Deterministic order
+
+        if file_paths.is_empty() {
+            anyhow::bail!("No .safetensors files found in {:?}", path.as_ref());
+        }
+
+        let mut mmaps = Vec::new();
+        for file_path in file_paths {
+            let file = File::open(&file_path)?;
+            let mmap = unsafe { MmapOptions::new().map(&file)? };
+            mmaps.push(mmap);
+        }
+
+        let mut st_vec = Vec::new();
+        for mmap in &mmaps {
+            st_vec.push(SafeTensors::deserialize(mmap)?);
+        }
+        let tensors = st_vec.as_slice();
+
+        // Note: get_tensor and friends in utils.rs now accept &[SafeTensors] as `tensors` arg.
+
+        let embed_tokens = get_tensor(&stream, tensors, "model.embed_tokens.weight")?;
         let lm_head = if config.tie_word_embeddings {
             embed_tokens.clone()
         } else {
-            get_tensor(&stream, &tensors, "lm_head.weight")?
+            get_tensor(&stream, tensors, "lm_head.weight")?
         };
 
         let head_dim = config.hidden_size / config.num_attention_heads;
@@ -75,12 +103,12 @@ impl Qwen2Model {
             let layer_weights = LayerWeights {
                 input_layernorm: get_tensor(
                     &stream,
-                    &tensors,
+                    tensors,
                     &format!("{}input_layernorm.weight", layer_prefix),
                 )?,
                 qkv_proj: concat_tensors(
                     &stream,
-                    &tensors,
+                    tensors,
                     &[
                         format!("{}self_attn.q_proj.weight", layer_prefix),
                         format!("{}self_attn.k_proj.weight", layer_prefix),
@@ -89,7 +117,7 @@ impl Qwen2Model {
                 )?,
                 qkv_bias: concat_tensors_or_zeros(
                     &stream,
-                    &tensors,
+                    tensors,
                     &[
                         format!("{}self_attn.q_proj.bias", layer_prefix),
                         format!("{}self_attn.k_proj.bias", layer_prefix),
@@ -99,17 +127,17 @@ impl Qwen2Model {
                 )?,
                 o_proj: get_tensor(
                     &stream,
-                    &tensors,
+                    tensors,
                     &format!("{}self_attn.o_proj.weight", layer_prefix),
                 )?,
                 post_attention_layernorm: get_tensor(
                     &stream,
-                    &tensors,
+                    tensors,
                     &format!("{}post_attention_layernorm.weight", layer_prefix),
                 )?,
                 gate_up_proj: concat_tensors(
                     &stream,
-                    &tensors,
+                    tensors,
                     &[
                         format!("{}mlp.gate_proj.weight", layer_prefix),
                         format!("{}mlp.up_proj.weight", layer_prefix),
@@ -117,13 +145,13 @@ impl Qwen2Model {
                 )?,
                 down_proj: get_tensor(
                     &stream,
-                    &tensors,
+                    tensors,
                     &format!("{}mlp.down_proj.weight", layer_prefix),
                 )?,
             };
             layers.push(layer_weights);
         }
-        let final_norm = get_tensor(&stream, &tensors, "model.norm.weight")?;
+        let final_norm = get_tensor(&stream, tensors, "model.norm.weight")?;
 
         let rope = RopeCache::new(
             &stream,

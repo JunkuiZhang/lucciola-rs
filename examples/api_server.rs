@@ -1,22 +1,22 @@
-use tower_http::cors::{CorsLayer, Any};
-use axum::{
-    extract::State,
-    routing::post,
-    Json, Router,
-    response::{IntoResponse, Sse},
-};
 use axum::response::sse::Event;
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use axum::{
+    Json, Router,
+    extract::State,
+    response::{IntoResponse, Sse},
+    routing::post,
+};
 use futures::stream::Stream;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tower_http::cors::{Any, CorsLayer};
 
+use lucciola::chat::ChatTemplate;
 use lucciola::models::Qwen2Model;
 use lucciola::sampler::Sampler;
-use lucciola::chat::ChatTemplate;
 
 #[derive(Deserialize)]
 struct ChatMessage {
@@ -132,14 +132,17 @@ async fn main() -> anyhow::Result<()> {
     // let model_path = "/app/lucciola/models/Qwen2.5-0.5B-Instruct";
     let model_path = "/app/lucciola/models/deepseek-coder-1.3b-base";
     if !std::path::Path::new(model_path).exists() {
-        anyhow::bail!("Model not found at {}. Please download it first.", model_path);
+        anyhow::bail!(
+            "Model not found at {}. Please download it first.",
+            model_path
+        );
     }
-    
+
     println!("Loading model from {}...", model_path);
     let model = Qwen2Model::load(0, model_path)?;
     let tokenizer = tokenizers::Tokenizer::from_file(format!("{}/tokenizer.json", model_path))
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-    
+
     println!("Model loaded successfully. Starting API server...");
 
     let state = Arc::new(AppState {
@@ -162,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     let address_str = "0.0.0.0:3000";
     let addr: SocketAddr = address_str.parse()?;
     println!("Listening on http://{}", address_str);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
@@ -173,7 +176,11 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
-    println!("Received request: {} messages, stream={:?}", request.messages.len(), request.stream);
+    println!(
+        "Received request: {} messages, stream={:?}",
+        request.messages.len(),
+        request.stream
+    );
 
     let mut template = ChatTemplate::new(Some("qwen2"));
     for msg in &request.messages {
@@ -187,46 +194,62 @@ async fn chat_completions(
             return Json(serde_json::json!({"error": e.to_string()})).into_response();
         }
     };
-    
+
     println!("Generated {} Input IDs", input_ids.len());
 
     let is_stream = request.stream.unwrap_or(false);
     let model_name = state.model_name.clone();
-    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let id = format!("chatcmpl-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = format!(
+        "chatcmpl-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
 
     if is_stream {
         // --- Streaming Response ---
         let (tx, rx) = mpsc::unbounded_channel::<Result<Event, axum::Error>>();
         let state_model = state.clone();
-        
+
         // Spawn blocking task for inference
         tokio::task::spawn_blocking(move || {
-            if input_ids.is_empty() { return; }
+            if input_ids.is_empty() {
+                return;
+            }
 
             let mut model = state_model.model.lock().unwrap();
             let mut sampler = Sampler::new(
-                None, 
-                request.temperature.unwrap_or(0.7), 
-                request.top_p.unwrap_or(0.9), 
-                1024
+                None,
+                request.temperature.unwrap_or(0.7),
+                request.top_p.unwrap_or(0.9),
+                1024,
             );
             let max_tokens = request.max_tokens.unwrap_or(512);
-            
+
             println!("Starting streaming generation...");
-            
+
             // 1. Send Role Chunk
-            let _ = tx.send(Ok(Event::default().json_data(ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model_name.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: ChunkDelta { role: Some("assistant".to_string()), content: None },
-                    finish_reason: None,
-                }],
-            }).unwrap()));
+            let _ = tx.send(Ok(Event::default()
+                .json_data(ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                        },
+                        finish_reason: None,
+                    }],
+                })
+                .unwrap()));
 
             // 2. Generate and Send Content Chunks
             let _ = model.generate(
@@ -242,42 +265,51 @@ async fn chat_completions(
                         model: model_name.clone(),
                         choices: vec![ChunkChoice {
                             index: 0,
-                            delta: ChunkDelta { role: None, content: Some(token.to_string()) },
+                            delta: ChunkDelta {
+                                role: None,
+                                content: Some(token.to_string()),
+                            },
                             finish_reason: None,
                         }],
                     };
-                    
+
                     if let Ok(_) = tx.send(Ok(Event::default().json_data(chunk).unwrap())) {
                         true // continue
                     } else {
                         false // channel closed, stop generation
                     }
-                }
+                },
             );
 
             // 3. Send Finish Chunk
-            let _ = tx.send(Ok(Event::default().json_data(ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model_name.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: ChunkDelta { role: None, content: None },
-                    finish_reason: Some("stop".to_string()),
-                }],
-            }).unwrap()));
-            
+            let _ = tx.send(Ok(Event::default()
+                .json_data(ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: None,
+                            content: None,
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                })
+                .unwrap()));
+
             // 4. Send [DONE]
             let _ = tx.send(Ok(Event::default().data("[DONE]")));
-            
+
             println!("Streaming complete.");
         });
 
         // Return SSE Stream
         let stream = UnboundedReceiverStream::new(rx);
-        Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response()
-
+        Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response()
     } else {
         // --- Non-Streaming Response ---
         let generated_text = if !input_ids.is_empty() {
@@ -286,10 +318,10 @@ async fn chat_completions(
                 let mut model = state_model.model.lock().unwrap();
                 let mut text_buffer = String::new();
                 let mut sampler = Sampler::new(
-                    None, 
-                    request.temperature.unwrap_or(0.7), 
-                    request.top_p.unwrap_or(0.9), 
-                    1024
+                    None,
+                    request.temperature.unwrap_or(0.7),
+                    request.top_p.unwrap_or(0.9),
+                    1024,
                 );
                 let _ = model.generate(
                     &input_ids,
@@ -298,11 +330,13 @@ async fn chat_completions(
                     &state_model.tokenizer,
                     |token| {
                         text_buffer.push_str(token);
-                        true 
-                    }
+                        true
+                    },
                 );
                 text_buffer
-            }).await.unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default()
         } else {
             String::new()
         };
@@ -320,7 +354,8 @@ async fn chat_completions(
                 },
                 finish_reason: "stop".to_string(),
             }],
-        }).into_response()
+        })
+        .into_response()
     }
 }
 
@@ -328,7 +363,11 @@ async fn completions(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
-    println!("Received completion request: prompt len={}, stream={:?}", request.prompt.len(), request.stream);
+    println!(
+        "Received completion request: prompt len={}, stream={:?}",
+        request.prompt.len(),
+        request.stream
+    );
 
     // For raw completions, we don't use ChatTemplate. We encode the prompt directly.
     let input_ids = match state.tokenizer.encode(request.prompt.clone(), true) {
@@ -343,28 +382,39 @@ async fn completions(
 
     let is_stream = request.stream.unwrap_or(false);
     let model_name = state.model_name.clone();
-    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let id = format!("cmpl-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = format!(
+        "cmpl-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
 
     if is_stream {
         // --- Streaming Response ---
         let (tx, rx) = mpsc::unbounded_channel::<Result<Event, axum::Error>>();
         let state_model = state.clone();
-        
+
         tokio::task::spawn_blocking(move || {
-            if input_ids.is_empty() { return; }
+            if input_ids.is_empty() {
+                return;
+            }
 
             let mut model = state_model.model.lock().unwrap();
             let mut sampler = Sampler::new(
-                None, 
-                request.temperature.unwrap_or(0.7), 
-                request.top_p.unwrap_or(0.9), 
-                1024
+                None,
+                request.temperature.unwrap_or(0.7),
+                request.top_p.unwrap_or(0.9),
+                1024,
             );
             let max_tokens = request.max_tokens.unwrap_or(512);
-            
+
             println!("Starting streaming completion...");
-            
+
             let _ = model.generate(
                 &input_ids,
                 &mut sampler,
@@ -382,36 +432,39 @@ async fn completions(
                             finish_reason: None,
                         }],
                     };
-                    
+
                     if let Ok(_) = tx.send(Ok(Event::default().json_data(chunk).unwrap())) {
-                        true 
+                        true
                     } else {
-                        false 
+                        false
                     }
-                }
+                },
             );
 
             // Send Finish Chunk
-            let _ = tx.send(Ok(Event::default().json_data(CompletionChunk {
-                id: id.clone(),
-                object: "text_completion".to_string(),
-                created,
-                model: model_name.clone(),
-                choices: vec![CompletionChunkChoice {
-                    text: "".to_string(),
-                    index: 0,
-                    finish_reason: Some("stop".to_string()),
-                }],
-            }).unwrap()));
-            
+            let _ = tx.send(Ok(Event::default()
+                .json_data(CompletionChunk {
+                    id: id.clone(),
+                    object: "text_completion".to_string(),
+                    created,
+                    model: model_name.clone(),
+                    choices: vec![CompletionChunkChoice {
+                        text: "".to_string(),
+                        index: 0,
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                })
+                .unwrap()));
+
             let _ = tx.send(Ok(Event::default().data("[DONE]")));
-            
+
             println!("Streaming completion complete.");
         });
 
         let stream = UnboundedReceiverStream::new(rx);
-        Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response()
-
+        Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response()
     } else {
         // --- Non-Streaming Response ---
         let generated_text = if !input_ids.is_empty() {
@@ -420,10 +473,10 @@ async fn completions(
                 let mut model = state_model.model.lock().unwrap();
                 let mut text_buffer = String::new();
                 let mut sampler = Sampler::new(
-                    None, 
-                    request.temperature.unwrap_or(0.7), 
-                    request.top_p.unwrap_or(0.9), 
-                    1024
+                    None,
+                    request.temperature.unwrap_or(0.7),
+                    request.top_p.unwrap_or(0.9),
+                    1024,
                 );
                 let _ = model.generate(
                     &input_ids,
@@ -432,11 +485,13 @@ async fn completions(
                     &state_model.tokenizer,
                     |token| {
                         text_buffer.push_str(token);
-                        true 
-                    }
+                        true
+                    },
                 );
                 text_buffer
-            }).await.unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default()
         } else {
             String::new()
         };
@@ -451,6 +506,7 @@ async fn completions(
                 index: 0,
                 finish_reason: "stop".to_string(),
             }],
-        }).into_response()
+        })
+        .into_response()
     }
 }
