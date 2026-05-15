@@ -6,6 +6,7 @@ use cudarc::cublas::sys::{
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use memmap2::MmapOptions;
+use rand::RngExt;
 use safetensors::SafeTensors;
 use std::{fs::File, path::Path, sync::Arc};
 use tokenizers::Tokenizer;
@@ -407,7 +408,6 @@ impl Qwen2Model {
 
         // Top-P GPU Path
         // We use a random float for sampling
-        use rand::Rng;
         let p_threshold = sampler.top_p();
         if p_threshold < 1.0 {
             let rand_val: f32 = rand::rng().random();

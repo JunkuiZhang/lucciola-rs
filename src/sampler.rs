@@ -1,6 +1,7 @@
 use anyhow::Result;
+use rand::RngExt;
 use rand::distr::Uniform;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{SeedableRng, rngs::StdRng};
 
 pub struct Sampler {
     rng: StdRng,
@@ -13,7 +14,7 @@ impl Sampler {
     pub fn new(seed: Option<u64>, temperature: f32, top_p: f32, top_k: usize) -> Self {
         let rng = match seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_os_rng(),
+            None => rand::make_rng(),
         };
         let top_k = if top_k == 0 {
             1024

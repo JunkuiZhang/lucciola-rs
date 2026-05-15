@@ -30,7 +30,11 @@ fn main() {
         }
         let source = std::fs::read_to_string(format!("src/kernels/{kernel}")).unwrap();
         let opts = CompileOptions {
-            include_paths: vec!["/usr/local/cuda/include".to_string()],
+            include_paths: vec![
+                "/opt/cuda/include".to_string(),
+                "/usr/include/cccl".to_string(),
+                "/usr/local/cuda/include".to_string(),
+            ],
             ..Default::default()
         };
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(&source, opts).unwrap();
