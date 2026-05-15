@@ -50,11 +50,12 @@ fn main() -> Result<()> {
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    decoder.generate(&input_ids, 256, &tokenizer, |text, debug_info| {
-        print!("{}", text);
-        let _ = std::io::stdout().flush();
+    let mut full_output = String::new();
 
-        // 打印调试信息到 stderr，不干扰主输出
+    decoder.generate(&input_ids, 256, &tokenizer, |text, debug_info| {
+        full_output.push_str(text);
+
+        // 打印调试信息到 stderr
         eprintln!(
             "[step={}, layer={}, α={:.4}, β={:.4}, H_f={:.4}, H_m={:.4}, H_a={:.4}, JS_m={:.6}, JS_a={:.6}]",
             debug_info.step,
@@ -71,6 +72,9 @@ fn main() -> Result<()> {
     })?;
 
     println!("\n--- 生成完成 ---");
+    println!("\n========== 完整输出 ==========");
+    println!("{}{}", prompt, full_output);
+    println!("========== 输出结束 ==========");
 
     Ok(())
 }
