@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     );
 
     // 2. Load Model
-    let mut model = Qwen2Model::load(0, model_path)?;
+    let mut model = Qwen2Model::load(0, model_path, 0.8)?;
     println!("Model loaded successfully.");
 
     // 3. Configure Sampler (Temp=0.8, Top-P=0.9)

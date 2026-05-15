@@ -48,7 +48,7 @@ pub struct Qwen2Model {
 }
 
 impl Qwen2Model {
-    pub fn load(gpu_id: usize, path: impl AsRef<Path>) -> Result<Self> {
+    pub fn load(gpu_id: usize, path: impl AsRef<Path>, kv_cache_memory_fraction: f32) -> Result<Self> {
         let device = CudaContext::new(gpu_id)?;
         let stream = device.new_stream()?;
         let blas = Arc::new(CudaBlas::new(stream.clone())?);
@@ -161,8 +161,8 @@ impl Qwen2Model {
             config.rope_theta,
             config.rope_scaling.as_ref().map(|s| s.factor),
         )?;
-        // Initialize KV Cache (using 80% of remaining free VRAM)
-        let kv_cache = KVCache::new(&device, &stream, &config, 0.8)?;
+        // Initialize KV Cache
+        let kv_cache = KVCache::new(&device, &stream, &config, kv_cache_memory_fraction)?;
         let cuda_functions = CudaFunctions::load(&device, head_dim)?;
         let buffers = InferenceBuffers::new(&stream, &config)?;
         let sample_indices_buffer = stream.alloc_zeros::<u32>(1)?;

@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Loading model from {}...", model_path);
-    let model = Qwen2Model::load(0, model_path)?;
+    let model = Qwen2Model::load(0, model_path, 0.8)?;
     let tokenizer = tokenizers::Tokenizer::from_file(format!("{}/tokenizer.json", model_path))
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 

@@ -19,13 +19,15 @@ fn main() -> Result<()> {
     );
 
     // 2. 加载主模型
+    // KV cache 显存比例：主模型用 0.7，为辅助模型预留空间
     println!("加载主模型: {} ...", main_model_path);
-    let main_model = Qwen2Model::load(0, main_model_path)?;
+    let main_model = Qwen2Model::load(0, main_model_path, 0.7)?;
     println!("主模型加载完成。");
 
     // 3. 加载辅助模型
+    // KV cache 显存比例：辅助模型用 0.9（此时剩余显存较少，尽量利用）
     println!("加载辅助模型: {} ...", aux_model_path);
-    let aux_model = Qwen2Model::load(0, aux_model_path)?;
+    let aux_model = Qwen2Model::load(0, aux_model_path, 0.9)?;
     println!("辅助模型加载完成。");
 
     // 4. 创建 MUCD 解码器
