@@ -3,6 +3,7 @@ pub mod config;
 pub mod kernels;
 pub mod layers;
 pub mod models;
+pub mod mucd;
 pub mod ptx;
 pub mod sampler;
 pub mod streamer;

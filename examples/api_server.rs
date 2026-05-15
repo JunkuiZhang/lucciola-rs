@@ -129,7 +129,7 @@ struct AppState {
 async fn main() -> anyhow::Result<()> {
     // Check if models exist
     // let model_path = "/app/lucciola/models/Qwen2.5-0.5B-Instruct";
-    let model_path = "/app/lucciola/models/deepseek-coder-1.3b-base";
+    let model_path = "/home/zjk/cuda/lucciola-rs/models/deepseek-coder-1.3b-base";
     if !std::path::Path::new(model_path).exists() {
         anyhow::bail!(
             "Model not found at {}. Please download it first.",

@@ -827,4 +827,199 @@ impl Qwen2Model {
 
         Ok(())
     }
+
+    // ==================== MUCD 相关方法 ====================
+
+    /// 带 hidden states 提取的 forward pass（仅支持 decode 阶段，seq_len=1）
+    /// candidate_layers: 需要捕获 hidden states 的层索引列表
+    /// 返回每个候选层的 hidden states（GPU 上的 buffer，[num_candidates * hidden_dim]）
+    pub fn forward_with_hidden_states(
+        &mut self,
+        input_ids: &[u32],
+        cache_pos: usize,
+        candidate_layers: &[usize],
+    ) -> Result<CudaSlice<bf16>> {
+        let stream = self.stream.clone();
+        let blas = &*self.blas;
+        let hidden_dim = self.config.hidden_size;
+        let rms_norm_eps = self.config.rms_norm_eps;
+        let funcs = &self.cuda_functions;
+        let rope = &self.rope;
+
+        let seq_len = input_ids.len();
+        assert_eq!(seq_len, 1, "forward_with_hidden_states 仅支持 seq_len=1 (decode 阶段)");
+
+        let token_id = input_ids[0] as usize;
+
+        // 0. 更新位置 buffer
+        stream.memcpy_htod(&[cache_pos as i32], &mut self.pos_buffer)?;
+
+        // 1. Embedding
+        let embed_offset = token_id * hidden_dim;
+        {
+            let embed_view = self
+                .embed_tokens
+                .slice(embed_offset..embed_offset + hidden_dim);
+            stream.memcpy_dtod(&embed_view, &mut self.buffers.hidden_states)?;
+        }
+
+        // 2. KVCache 分配检查
+        self.kv_cache.prepare_for_step(&stream, cache_pos)?;
+
+        // 3. 分配 hidden states 收集 buffer
+        let mut hidden_states_collection =
+            stream.alloc_zeros::<bf16>(candidate_layers.len() * hidden_dim)?;
+
+        // 4. 逐层前向传播，捕获候选层的 hidden states
+        let mut bufs = ForwardPassBuffers {
+            hidden_states: &mut self.buffers.hidden_states,
+            norm_buffer: &mut self.buffers.norm_buffer,
+            qkv_states: &mut self.buffers.qkv_states,
+            att_output: &mut self.buffers.att_output,
+            gate_up_states: &mut self.buffers.gate_up_states,
+        };
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            Self::forward_layer(
+                &stream,
+                blas,
+                &self.config,
+                funcs,
+                rope,
+                &mut self.kv_cache,
+                layer,
+                i,
+                1,
+                cache_pos,
+                &mut self.pos_buffer,
+                &mut bufs,
+            )?;
+
+            // 如果当前层是候选层，捕获 hidden states
+            if let Some(candidate_idx) = candidate_layers.iter().position(|&l| l == i) {
+                let dst_offset = candidate_idx * hidden_dim;
+                let src_view = bufs.hidden_states.slice(0..hidden_dim);
+                let mut dst_view =
+                    hidden_states_collection.slice_mut(dst_offset..dst_offset + hidden_dim);
+                stream.memcpy_dtod(&src_view, &mut dst_view)?;
+            }
+        }
+
+        // 5. 最终 RMSNorm（用于最终层 logits 计算）
+        funcs.apply_rmsnorm(
+            &stream,
+            bufs.hidden_states,
+            None,
+            &self.final_norm,
+            rms_norm_eps,
+        )?;
+
+        Ok(hidden_states_collection)
+    }
+
+    /// 批量计算 premature layers 的 logits
+    /// hidden_states_collection: [num_candidates * hidden_dim] 的 GPU buffer
+    /// num_candidates: 候选层数量
+    /// 返回 f32 logits: [num_candidates][vocab_size]
+    pub fn compute_premature_logits_batched(
+        &self,
+        hidden_states_collection: &CudaSlice<bf16>,
+        num_candidates: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let stream = self.stream.clone();
+        let vocab_size = self.config.vocab_size;
+        let hidden_dim = self.config.hidden_size;
+
+        // 分配输出 buffer: [num_candidates, vocab_size]
+        let mut logits_buf = stream.alloc_zeros::<bf16>(num_candidates * vocab_size)?;
+
+        // 批量 matmul: C[V, N] = lm_head[V, H] * hidden_states[H, N]
+        // CuBLAS col-major:
+        // A_mem = lm_head [H, V] (row-major [V, H]) -> OP_T, lda=H
+        // B_mem = hidden_states [H, N] (each column is one candidate) -> OP_N, ldb=H
+        // C_mem = logits [V, N], ldc=V
+        //
+        // 但实际上 hidden_states_collection 的布局是 [N, H]（行优先），
+        // 即每行是一个候选层的 hidden state。
+        // CuBLAS 看到的是列优先 [H, N]（转置关系），所以：
+        // B_mem = [H, N] col-major，但实际存储是 [N, H] row-major，等价于 [H, N]^T col-major
+        // 所以 B 也需要 OP_T，ldb = hidden_dim (行步长)
+        //
+        // 重新整理：
+        // 我们要计算 C = A * B，其中 A = lm_head [V, H], B = hidden [N, H]
+        // C = A * B^T  -> [V, H] * [H, N] = [V, N]
+        // CuBLAS: op(A) = lm_head^T (col [H,V]), op(B) = hidden (col [H, N] = row [N, H])
+        // m=V, n=N, k=H
+        // A: OP_T, lda=H (lm_head is [H, V] in col-major = [V, H] row-major)
+        // B: OP_T, ldb=H (hidden is [N, H] in row-major, same as [H, N]^T in col-major -> OP_T with ldb=H... hmm)
+        //
+        // 让我们更简单地处理：逐个候选层计算
+        for c in 0..num_candidates {
+            let h_offset = c * hidden_dim;
+            let l_offset = c * vocab_size;
+
+            let h_view = hidden_states_collection.slice(h_offset..h_offset + hidden_dim);
+            let mut l_view = logits_buf.slice_mut(l_offset..l_offset + vocab_size);
+
+            // C[V,1] = lm_head[V,H] * h[H,1]
+            let alpha = 1.0f32;
+            let beta = 0.0f32;
+            unsafe {
+                use cudarc::cublas::sys::*;
+                use cudarc::driver::{DevicePtr, DevicePtrMut};
+                cublasGemmEx(
+                    *self.blas.handle(),
+                    cublasOperation_t::CUBLAS_OP_T,
+                    cublasOperation_t::CUBLAS_OP_N,
+                    vocab_size as i32,  // m
+                    1,                  // n
+                    hidden_dim as i32,  // k
+                    &alpha as *const f32 as *const _,
+                    self.lm_head.device_ptr(&stream).0 as *const _,
+                    cudaDataType::CUDA_R_16BF,
+                    hidden_dim as i32,  // lda
+                    h_view.device_ptr(&stream).0 as *const _,
+                    cudaDataType::CUDA_R_16BF,
+                    hidden_dim as i32,  // ldb
+                    &beta as *const f32 as *const _,
+                    l_view.device_ptr_mut(&stream).0 as *mut _,
+                    cudaDataType::CUDA_R_16BF,
+                    vocab_size as i32,  // ldc
+                    cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                );
+            }
+        }
+
+        // 将所有 logits 拷回 CPU 并转为 f32
+        let host_data = stream.clone_dtoh(&logits_buf)?;
+        let mut result = Vec::with_capacity(num_candidates);
+        for c in 0..num_candidates {
+            let offset = c * vocab_size;
+            let logits_f32: Vec<f32> = host_data[offset..offset + vocab_size]
+                .iter()
+                .map(|x| x.to_f32())
+                .collect();
+            result.push(logits_f32);
+        }
+
+        Ok(result)
+    }
+
+    /// 将当前 logits buffer 拷贝到 CPU 并转为 f32
+    pub fn get_logits_f32(&mut self) -> Result<Vec<f32>> {
+        self.compute_logits()?;
+        let stream = self.stream.clone();
+        let host_data = stream.clone_dtoh(&self.buffers.logits)?;
+        Ok(host_data.iter().map(|x| x.to_f32()).collect())
+    }
+
+    /// 重置 KV Cache（用于新的生成请求）
+    pub fn reset_kv_cache(&mut self) {
+        // 将所有已分配的 block 归还到 free list
+        for &block_id in self.kv_cache.block_table_cpu.iter().rev() {
+            self.kv_cache.free_blocks.push(block_id);
+        }
+        self.kv_cache.block_table_cpu.clear();
+    }
 }

@@ -10,13 +10,13 @@ if os.getenv('HF_ENDPOINT'):
 #     local_dir='./models/Qwen2.5-0.5B-Instruct',
 #     allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'],
 # )
-# snapshot_download(
-#     repo_id='deepseek-ai/deepseek-coder-1.3b-base',
-#     local_dir='./models/deepseek-coder-1.3b-base',
-#     allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'],
-# )
 snapshot_download(
-    repo_id='deepseek-ai/deepseek-coder-6.7b-base',
-    local_dir='./models/deepseek-coder-6.7b-base',
+    repo_id='deepseek-ai/deepseek-coder-1.3b-base',
+    local_dir='./models/deepseek-coder-1.3b-base',
     allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'],
 )
+# snapshot_download(
+#     repo_id='deepseek-ai/deepseek-coder-6.7b-base',
+#     local_dir='./models/deepseek-coder-6.7b-base',
+#     allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'],
+# )
