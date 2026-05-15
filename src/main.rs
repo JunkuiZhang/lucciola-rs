@@ -24,7 +24,8 @@ fn main() -> Result<()> {
     // let mut sampler = Sampler::new(Some(42), 0.8, 0.9, 0);
     let mut sampler = Sampler::new(None, 0.8, 0.9, 0);
 
-    let prompt = "请介绍一下量子计算的基本原理。";
+    // let prompt = "请介绍一下量子计算的基本原理。";
+    let prompt = "Write a python script to calculate the fibonacci series, please show your reasoning step by step.";
     // 4. Chat Template
     let mut chat = ChatTemplate::new(Some(&model.config.model_type));
     chat.add("system", "You are a helpful assistant.");
