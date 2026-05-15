@@ -5,7 +5,6 @@ use axum::{
     response::{IntoResponse, Sse},
     routing::post,
 };
-use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
