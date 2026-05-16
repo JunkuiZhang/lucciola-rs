@@ -13,7 +13,7 @@ if os.getenv('HF_ENDPOINT'):
 snapshot_download(
     repo_id='deepseek-ai/deepseek-coder-1.3b-base',
     local_dir='./models/deepseek-coder-1.3b-base',
-    allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'],
+    allow_patterns=['*.bin', 'config.json', 'tokenizer.json'],
 )
 # snapshot_download(
 #     repo_id='deepseek-ai/deepseek-coder-6.7b-base',
