@@ -1,3 +1,11 @@
+"""
+此文件直接从如下地址复制而来：
+https://github.com/IBM/convert-to-safetensors/blob/main/convert_to_safetensor.py
+
+其余实现参考：
+https://huggingface.co/spaces/safetensors/convert/blob/main/convert.py
+"""
+
 import argparse
 import os
 import shutil
